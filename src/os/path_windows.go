@@ -6,6 +6,7 @@ package os
 
 import (
 	"internal/filepathlite"
+	"internal/stringslite"
 	"internal/syscall/windows"
 	"syscall"
 )
@@ -149,4 +150,46 @@ func addExtendedPrefix(path string) string {
 	}
 	copy(buf, prefix)
 	return syscall.UTF16ToString(buf)
+}
+
+func validatePathForCreate(path string) bool {
+	// Check if the path is empty.
+	if len(path) == 0 {
+		return true
+	}
+	// Paths starting with \\?\ should be considered valid without further checks.
+	if stringslite.HasPrefix(path, `\\?\`) || stringslite.HasPrefix(path, `\\?\UNC\`) {
+		return true
+	}
+	// Get the base name of the path to check only the last component.
+	base := filepathlite.Base(path)
+	// Check if the last character of the base name is a space or period, which is invalid.
+	lastChar := base[len(base)-1]
+	if lastChar == ' ' || lastChar == '.' {
+		// If the last character is a period get the previous character.
+		if lastChar == '.' {
+			// If the path is only a period, it is valid.
+			if len(path) == 1 {
+				return true
+			}
+			i := len(path) - 1
+			for ; i >= len(path)-3 && i > 0; i-- {
+				if path[i] == '/' || path[i] == '\\' || path[i] == ':' {
+					break
+				}
+			}
+			v := path[i:]
+			switch v {
+			case ".", "/.", "\\.", "..", "/..", "\\..":
+				return true
+			case ":.", ":..":
+				// Colon must be the second char e.g C:. or C:..
+				if path[1] == ':' && (len(path) == 3 || len(path) == 4) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return true
 }
