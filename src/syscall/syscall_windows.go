@@ -23,6 +23,8 @@ type Handle uintptr
 
 const InvalidHandle = ^Handle(0)
 
+var errInvalidPath = errors.New("invalid path: cannot end with a space or period")
+
 // StringToUTF16 returns the UTF-16 encoding of the UTF-8 string s,
 // with a terminating NUL added. If s contains a NUL byte this
 // function panics instead of returning an error.
@@ -344,6 +346,9 @@ func Open(path string, mode int, perm uint32) (fd Handle, err error) {
 	if len(path) == 0 {
 		return InvalidHandle, ERROR_FILE_NOT_FOUND
 	}
+	if !isValidWindowsPath(path) {
+		return InvalidHandle, errInvalidPath
+	}
 	pathp, err := UTF16PtrFromString(path)
 	if err != nil {
 		return InvalidHandle, err
@@ -564,6 +569,9 @@ func Chdir(path string) (err error) {
 }
 
 func Mkdir(path string, mode uint32) (err error) {
+	if !isValidWindowsPath(path) {
+		return InvalidHandle, errInvalidPath
+	}
 	pathp, err := UTF16PtrFromString(path)
 	if err != nil {
 		return err
@@ -1452,4 +1460,21 @@ func RegEnumKeyEx(key Handle, index uint32, name *uint16, nameLen *uint32, reser
 func GetStartupInfo(startupInfo *StartupInfo) error {
 	getStartupInfo(startupInfo)
 	return nil
+}
+
+func isValidWindowsPath(path string) bool {
+	// Check if the path is empty.
+	if len(path) == 0 {
+		return true
+	}
+	// UNC paths starting with \\?\ should be considered valid without further checks.
+	if len(path) >= 4 && path[:4] == `\\?\` {
+		return true
+	}
+	// Check if the last character is a space or period, which is invalid for non-UNC paths.
+	lastChar := path[len(path)-1]
+	if lastChar == ' ' || lastChar == '.' {
+		return false
+	}
+	return true
 }
