@@ -32,6 +32,11 @@ on:
         required: false
         type: string
         default: "gotip-windows-arm64-github"
+      repository:
+        description: "Go repository to check out (owner/repo)"
+        required: false
+        type: string
+        default: "golang/go"
 
 permissions:
   contents: read
@@ -49,7 +54,7 @@ jobs:
       - name: Checkout Go source
         uses: actions/checkout@v4
         with:
-          repository: golang/go
+          repository: ${{ inputs.repository }}
           ref: ${{ inputs.commit_sha }}
           fetch-depth: 1
 

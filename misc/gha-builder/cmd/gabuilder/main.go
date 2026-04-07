@@ -23,6 +23,8 @@
 package main
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -32,12 +34,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path"
+	"sort"
 	"strings"
 	"time"
 )
 
 var (
-	flagRepo         = flag.String("repo", "", "GitHub repository as owner/repo (required)")
+	flagRepo         = flag.String("repo", "", "GitHub repository as owner/repo where the workflow lives (required)")
 	flagCommit       = flag.String("commit", "", "commit SHA to test (required)")
 	flagTokenFile    = flag.String("token-file", "", "path to file containing GitHub token")
 	flagBuilderName  = flag.String("builder-name", "gotip-windows-arm64-msft", "GO_BUILDER_NAME to pass to the workflow")
@@ -47,6 +51,7 @@ var (
 	flagTestShards   = flag.String("test-shards", "1", "number of test shards")
 	flagPollInterval = flag.Duration("poll-interval", 30*time.Second, "interval between status polls")
 	flagTimeout      = flag.Duration("timeout", 150*time.Minute, "overall timeout for the workflow run")
+	flagGoRepo       = flag.String("go-repo", "golang/go", "Go source repository to check out inside the workflow (owner/repo)")
 )
 
 func main() {
@@ -81,6 +86,7 @@ func main() {
 		"build_id":     *flagBuildID,
 		"builder_name": *flagBuilderName,
 		"test_shards":  *flagTestShards,
+		"repository":   *flagGoRepo,
 	})
 	if err != nil {
 		log.Fatalf("Failed to dispatch workflow: %v", err)
@@ -293,62 +299,83 @@ func (c *ghClient) getRunStatus(ctx context.Context, runID int64) (status, concl
 }
 
 // streamLogs downloads the workflow run logs and writes them to w.
+// GitHub returns logs as a zip archive with one text file per step.
+// We download the zip into memory, then extract and print each file
+// in sorted order so the output is readable in the LUCI build UI.
 func (c *ghClient) streamLogs(ctx context.Context, runID int64, w io.Writer) error {
-	url := fmt.Sprintf("%s/repos/%s/actions/runs/%d/logs", c.apiURL, c.repo, runID)
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	zipData, err := c.downloadLogsZip(ctx, runID)
 	if err != nil {
 		return err
 	}
+	return extractAndPrintLogs(zipData, w)
+}
+
+// downloadLogsZip fetches the log archive for a workflow run into memory.
+func (c *ghClient) downloadLogsZip(ctx context.Context, runID int64) ([]byte, error) {
+	url := fmt.Sprintf("%s/repos/%s/actions/runs/%d/logs", c.apiURL, c.repo, runID)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
 	c.setHeaders(req)
 
-	// The logs endpoint returns a 302 redirect to the actual log archive.
-	// Use a client that doesn't follow redirects so we can handle it.
-	noRedirectClient := &http.Client{
-		Timeout: 60 * time.Second,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
-	resp, err := noRedirectClient.Do(req)
+	// Use a client with longer timeout for log downloads and that follows redirects.
+	dlClient := &http.Client{Timeout: 120 * time.Second}
+	resp, err := dlClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("request logs: %w", err)
+		return nil, fmt.Errorf("request logs: %w", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusFound {
-		// Follow the redirect to download the log archive.
-		logURL := resp.Header.Get("Location")
-		if logURL == "" {
-			return fmt.Errorf("logs redirect has no Location header")
-		}
-		logReq, err := http.NewRequestWithContext(ctx, "GET", logURL, nil)
-		if err != nil {
-			return err
-		}
-		logResp, err := c.http.Do(logReq)
-		if err != nil {
-			return fmt.Errorf("download logs: %w", err)
-		}
-		defer logResp.Body.Close()
-
-		// The response is a zip archive. For now, write the raw stream.
-		// A future improvement could unzip and pretty-print individual job logs.
-		fmt.Fprintf(w, "=== GitHub Actions logs for run %d (zip archive, %d bytes) ===\n", runID, logResp.ContentLength)
-		n, err := io.Copy(w, logResp.Body)
-		if err != nil {
-			return fmt.Errorf("stream logs: %w", err)
-		}
-		log.Printf("Downloaded %d bytes of logs", n)
-		return nil
-	}
-
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("logs returned status %d: %s", resp.StatusCode, body)
+		return nil, fmt.Errorf("logs returned status %d: %s", resp.StatusCode, body)
 	}
 
-	_, err = io.Copy(w, resp.Body)
-	return err
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read log archive: %w", err)
+	}
+	log.Printf("Downloaded %d bytes of logs", len(data))
+	return data, nil
+}
+
+// extractAndPrintLogs unzips a GitHub Actions log archive and writes each
+// step's log to w, sorted by filename so steps appear in order.
+func extractAndPrintLogs(zipData []byte, w io.Writer) error {
+	r, err := zip.NewReader(bytes.NewReader(zipData), int64(len(zipData)))
+	if err != nil {
+		return fmt.Errorf("open zip: %w", err)
+	}
+
+	// Sort files by name so steps appear in execution order.
+	// GitHub names them like "test/1_Set up job.txt", "test/2_Checkout.txt", etc.
+	files := make([]*zip.File, len(r.File))
+	copy(files, r.File)
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].Name < files[j].Name
+	})
+
+	for _, f := range files {
+		if f.FileInfo().IsDir() {
+			continue
+		}
+		name := path.Base(f.Name)
+		fmt.Fprintf(w, "\n=== %s ===\n", name)
+
+		rc, err := f.Open()
+		if err != nil {
+			fmt.Fprintf(w, "[error opening %s: %v]\n", f.Name, err)
+			continue
+		}
+		if _, err := io.Copy(w, rc); err != nil {
+			rc.Close()
+			fmt.Fprintf(w, "[error reading %s: %v]\n", f.Name, err)
+			continue
+		}
+		rc.Close()
+	}
+	return nil
 }
 
 func (c *ghClient) setHeaders(req *http.Request) {
