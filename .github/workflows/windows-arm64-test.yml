@@ -70,6 +70,25 @@ jobs:
           echo "Bootstrap GOROOT: $goroot"
           go version
 
+      - name: Set up ARM64-capable C compiler
+        shell: pwsh
+        run: |
+          # The Git-for-Windows gcc is an x86-64 assembler and cannot compile
+          # runtime/cgo/gcc_arm64.S. Use LLVM clang which supports ARM64 natively.
+          if (Get-Command clang -ErrorAction SilentlyContinue) {
+            $v = (clang --version 2>&1 | Select-Object -First 1)
+            Write-Output "Found clang: $v"
+          } else {
+            Write-Output "clang not found, installing LLVM via chocolatey..."
+            choco install llvm -y --no-progress
+            $llvmBin = "C:\Program Files\LLVM\bin"
+            echo $llvmBin >> $env:GITHUB_PATH
+            $env:PATH = "$llvmBin;$env:PATH"
+            $v = (clang --version 2>&1 | Select-Object -First 1)
+            Write-Output "Installed: $v"
+          }
+          echo "CC=clang" >> $env:GITHUB_ENV
+
       - name: Build Go toolchain
         shell: pwsh
         working-directory: src
