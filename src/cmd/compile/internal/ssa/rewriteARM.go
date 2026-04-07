@@ -446,6 +446,9 @@ func rewriteValueARM(v *Value) bool {
 	case OpAdd32carry:
 		v.Op = OpARMADDS
 		return true
+	case OpAdd32carrywithcarry:
+		v.Op = OpARMADCS
+		return true
 	case OpAdd32withcarry:
 		v.Op = OpARMADC
 		return true
@@ -872,6 +875,9 @@ func rewriteValueARM(v *Value) bool {
 		return true
 	case OpTailCall:
 		v.Op = OpARMCALLtail
+		return true
+	case OpTailCallInter:
+		v.Op = OpARMCALLtailinter
 		return true
 	case OpTrunc16to8:
 		v.Op = OpCopy

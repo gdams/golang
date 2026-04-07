@@ -402,7 +402,7 @@ func genAMD64(g *gen) {
 	// Create layouts for X, Y, and Z registers.
 	const (
 		numXRegs = 16
-		numZRegs = 16 // TODO: If we start using upper registers, change to 32
+		numZRegs = 32
 		numKRegs = 8
 	)
 	lZRegs := layout{sp: xReg} // Non-GP registers
@@ -757,6 +757,13 @@ func genLoong64(g *gen) {
 	l.addSpecial(
 		sv+mov+" R5, %d(R3)",
 		mov+" %d(R3), R5\n"+rs,
+		regsize)
+
+	// Add floating point control/status register fcsr0,
+	// fcsr1~fcsr3 are aliases for some fields in fcsr0.
+	l.addSpecial(
+		mov+" FCSR0, R5\n"+mov+" R5, %d(R3)",
+		mov+" %d(R3), R5\n"+mov+" R5, FCSR0",
 		regsize)
 
 	// Create layouts for lasx, lsx and fp registers.

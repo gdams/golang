@@ -146,19 +146,20 @@ type timespec32 struct {
 
 //go:nosplit
 func (ts *timespec32) setNsec(ns int64) {
-	ts.tv_sec = timediv(ns, 1e9, &ts.tv_nsec)
+	ts.tv_sec = int32(ns / 1e9)
+	ts.tv_nsec = int32(ns % 1e9)
 }
 
 type timespec struct {
 	tv_sec  int64
-	tv_nsec int64
+	tv_nsec int32
+	_       [4]byte // the C ABI aligns int64 to 8 bytes
 }
 
 //go:nosplit
 func (ts *timespec) setNsec(ns int64) {
-	var newNS int32
-	ts.tv_sec = int64(timediv(ns, 1e9, &newNS))
-	ts.tv_nsec = int64(newNS)
+	ts.tv_sec = ns / 1e9
+	ts.tv_nsec = int32(ns % 1e9)
 }
 
 type timeval struct {

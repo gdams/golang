@@ -24,6 +24,7 @@ import (
 	"maps"
 	"net"
 	"net/http/httptrace"
+	"net/http/internal"
 	"net/http/internal/ascii"
 	"net/textproto"
 	"net/url"
@@ -87,7 +88,7 @@ const DefaultMaxIdleConnsPerHost = 2
 // ClientTrace.Got1xxResponse.
 //
 // Transport only retries a request upon encountering a network error
-// if the connection has been already been used successfully and if the
+// if the connection has already been used successfully and if the
 // request is idempotent and either has no body or has its [Request.GetBody]
 // defined. HTTP requests are considered idempotent if they have HTTP methods
 // GET, HEAD, OPTIONS, or TRACE; or if their [Header] map contains an
@@ -288,8 +289,9 @@ type Transport struct {
 	// nextProtoOnce guards initialization of TLSNextProto and
 	// h2transport (via onceSetNextProtoDefaults)
 	nextProtoOnce      sync.Once
-	h2transport        h2Transport // non-nil if http2 wired up
-	tlsNextProtoWasNil bool        // whether TLSNextProto was nil when the Once fired
+	h2transport        h2Transport      // non-nil if http2 wired up
+	h3transport        dialClientConner // non-nil if http3 wired up
+	tlsNextProtoWasNil bool             // whether TLSNextProto was nil when the Once fired
 
 	// ForceAttemptHTTP2 controls whether HTTP/2 is enabled when a non-zero
 	// Dial, DialTLS, or DialContext func or TLSClientConfig is provided.
@@ -380,6 +382,45 @@ func (t *Transport) Clone() *Transport {
 	return t2
 }
 
+type dialClientConner interface {
+	// DialClientConn creates a new client connection to address.
+	//
+	// If proxy is non-nil, the connection should use the provided proxy.
+	// If HTTP/3 proxies are not supported, DialClientConn should return
+	// an error wrapping [errors.ErrUnsupported].
+	//
+	// The RoundTripper returned by DialClientConn must also implement the
+	// following methods to support [ClientConn] methods of the same name:
+	//	Close() error
+	//	Err() error
+	// 	Reserve() error
+	//	Release() error
+	//	Available() int
+	//	InFlight() int
+	//
+	// The client connection should arrange to call internalStateHook
+	// when the connection closes, when requests complete, and when the
+	// connection concurrency limit changes.
+	//
+	// The client connection must call the internal state hook when
+	// the connection state changes asynchronously, such as when a request completes.
+	//
+	// The internal state hook need not be called after synchronous changes
+	// to the state: Close, Reserve, Release, and RoundTrip calls
+	// which don't start a request do not need to call the hook.
+	DialClientConn(ctx context.Context, address string, proxy *url.URL, internalStateHook func()) (RoundTripper, error)
+}
+
+type closeIdleConnectionser interface {
+	// CloseIdleConnections is called by Transport.CloseIdleConnections.
+	//
+	// The transport will close idle connections created with DialClientConn
+	// before calling this method. The HTTP/3 transport should not attempt to
+	// close idle connections, but may clean up shared resources such as UDP
+	// sockets if no connections remain.
+	CloseIdleConnections()
+}
+
 // h2Transport is the interface we expect to be able to call from
 // net/http against an *http2.Transport that's either bundled into
 // h2_bundle.go or supplied by the user via x/net/http2.
@@ -431,34 +472,8 @@ func (t *Transport) onceSetNextProtoDefaults() {
 	if omitBundledHTTP2 {
 		return
 	}
-	t2, err := http2configureTransports(t)
-	if err != nil {
-		log.Printf("Error enabling Transport HTTP/2 support: %v", err)
-		return
-	}
-	t.h2transport = t2
 
-	// Auto-configure the http2.Transport's MaxHeaderListSize from
-	// the http.Transport's MaxResponseHeaderBytes. They don't
-	// exactly mean the same thing, but they're close.
-	//
-	// TODO: also add this to x/net/http2.Configure Transport, behind
-	// a +build go1.7 build tag:
-	if limit1 := t.MaxResponseHeaderBytes; limit1 != 0 && t2.MaxHeaderListSize == 0 {
-		const h2max = 1<<32 - 1
-		if limit1 >= h2max {
-			t2.MaxHeaderListSize = h2max
-		} else {
-			t2.MaxHeaderListSize = uint32(limit1)
-		}
-	}
-
-	// Server.ServeTLS clones the tls.Config before modifying it.
-	// Transport doesn't. We may want to make the two consistent some day.
-	//
-	// http2configureTransport will have already set NextProtos, but adjust it again
-	// here to remove HTTP/1.1 if the user has disabled it.
-	t.TLSClientConfig.NextProtos = adjustNextProtos(t.TLSClientConfig.NextProtos, protocols)
+	t.configureHTTP2(protocols)
 }
 
 func (t *Transport) protocols() Protocols {
@@ -748,6 +763,11 @@ func (t *Transport) roundTrip(req *Request) (_ *Response, err error) {
 	}
 }
 
+func http2isNoCachedConnError(err error) bool {
+	_, ok := err.(interface{ IsHTTP2NoCachedConnError() })
+	return ok
+}
+
 func awaitLegacyCancel(ctx context.Context, cancel context.CancelCauseFunc, req *Request) {
 	select {
 	case <-req.Cancel:
@@ -863,7 +883,7 @@ func (pc *persistConn) shouldRetryRequest(req *Request, err error) bool {
 }
 
 // ErrSkipAltProtocol is a sentinel error value defined by Transport.RegisterProtocol.
-var ErrSkipAltProtocol = errors.New("net/http: skip alternate protocol")
+var ErrSkipAltProtocol = internal.ErrSkipAltProtocol
 
 // RegisterProtocol registers a new protocol with scheme.
 // The [Transport] will pass requests using the given scheme to rt.
@@ -876,11 +896,25 @@ var ErrSkipAltProtocol = errors.New("net/http: skip alternate protocol")
 // handle the [Transport.RoundTrip] itself for that one request, as if the
 // protocol were not registered.
 func (t *Transport) RegisterProtocol(scheme string, rt RoundTripper) {
+	if err := t.registerProtocol(scheme, rt); err != nil {
+		panic(err)
+	}
+}
+
+func (t *Transport) registerProtocol(scheme string, rt RoundTripper) error {
 	t.altMu.Lock()
 	defer t.altMu.Unlock()
+
+	if scheme == "http/3" {
+		var ok bool
+		if t.h3transport, ok = rt.(dialClientConner); !ok {
+			panic("http: HTTP/3 RoundTripper does not implement DialClientConn")
+		}
+	}
+
 	oldMap, _ := t.altProto.Load().(map[string]RoundTripper)
 	if _, exists := oldMap[scheme]; exists {
-		panic("protocol " + scheme + " already registered")
+		return errors.New("protocol " + scheme + " already registered")
 	}
 	newMap := maps.Clone(oldMap)
 	if newMap == nil {
@@ -888,6 +922,7 @@ func (t *Transport) RegisterProtocol(scheme string, rt RoundTripper) {
 	}
 	newMap[scheme] = rt
 	t.altProto.Store(newMap)
+	return nil
 }
 
 // CloseIdleConnections closes any connections which were previously
@@ -916,6 +951,9 @@ func (t *Transport) CloseIdleConnections() {
 	t.connsPerHostMu.Unlock()
 	if t2 := t.h2transport; t2 != nil {
 		t2.CloseIdleConnections()
+	}
+	if cc, ok := t.h3transport.(closeIdleConnectionser); ok {
+		cc.CloseIdleConnections()
 	}
 }
 
@@ -1067,6 +1105,22 @@ func (t *Transport) tryPutIdleConn(pconn *persistConn) error {
 		return errConnBroken
 	}
 	pconn.markReused()
+	if pconn.isClientConn {
+		// internalStateHook is always set for conns created by NewClientConn.
+		defer pconn.internalStateHook()
+		pconn.mu.Lock()
+		defer pconn.mu.Unlock()
+		if !pconn.inFlight {
+			panic("pconn is not in flight")
+		}
+		pconn.inFlight = false
+		select {
+		case pconn.availch <- struct{}{}:
+		default:
+			panic("unable to make pconn available")
+		}
+		return nil
+	}
 
 	t.idleMu.Lock()
 	defer t.idleMu.Unlock()
@@ -1243,6 +1297,9 @@ func (t *Transport) queueForIdleConn(w *wantConn) (delivered bool) {
 
 // removeIdleConn marks pconn as dead.
 func (t *Transport) removeIdleConn(pconn *persistConn) bool {
+	if pconn.isClientConn {
+		return true
+	}
 	t.idleMu.Lock()
 	defer t.idleMu.Unlock()
 	return t.removeIdleConnLocked(pconn)
@@ -1625,7 +1682,8 @@ func (t *Transport) dialConnFor(w *wantConn) {
 		return
 	}
 
-	pc, err := t.dialConn(ctx, w.cm)
+	const isClientConn = false
+	pc, err := t.dialConn(ctx, w.cm, isClientConn, nil)
 	delivered := w.tryDeliver(pc, err, time.Time{})
 	if err == nil && (!delivered || pc.alt != nil) {
 		// pconn was not passed to w,
@@ -1746,15 +1804,39 @@ type erringRoundTripper interface {
 
 var testHookProxyConnectTimeout = context.WithTimeout
 
-func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (pconn *persistConn, err error) {
+func (t *Transport) dialConn(ctx context.Context, cm connectMethod, isClientConn bool, internalStateHook func()) (pconn *persistConn, err error) {
+	// TODO: actually support HTTP/3. Among other things:
+	// - make HTTP/3 play well with proxy.
+	// - implement happy eyeball between HTTP/3 and HTTP/1 & HTTP/2.
+	// - clean up the connection pooling logic.
+	if p := t.protocols(); p.http3() {
+		if p.HTTP1() || p.HTTP2() || p.UnencryptedHTTP2() {
+			return nil, errors.New("http: when using HTTP3, Transport.Protocols must contain only HTTP3")
+		}
+		if t.h3transport == nil {
+			return nil, errors.New("http: Transport.Protocols contains HTTP3, but Transport does not support HTTP/3")
+		}
+		rt, err := t.h3transport.DialClientConn(ctx, cm.addr(), cm.proxyURL, internalStateHook)
+		if err != nil {
+			return nil, err
+		}
+		return &persistConn{
+			t:        t,
+			cacheKey: cm.key(),
+			alt:      rt,
+		}, nil
+	}
+
 	pconn = &persistConn{
-		t:             t,
-		cacheKey:      cm.key(),
-		reqch:         make(chan requestAndChan, 1),
-		writech:       make(chan writeRequest, 1),
-		closech:       make(chan struct{}),
-		writeErrCh:    make(chan error, 1),
-		writeLoopDone: make(chan struct{}),
+		t:                 t,
+		cacheKey:          cm.key(),
+		reqch:             make(chan requestAndChan, 1),
+		writech:           make(chan writeRequest, 1),
+		closech:           make(chan struct{}),
+		writeErrCh:        make(chan error, 1),
+		writeLoopDone:     make(chan struct{}),
+		isClientConn:      isClientConn,
+		internalStateHook: internalStateHook,
 	}
 	trace := httptrace.ContextClientTrace(ctx)
 	wrapErr := func(err error) error {
@@ -1927,6 +2009,21 @@ func (t *Transport) dialConn(ctx context.Context, cm connectMethod) (pconn *pers
 		t.Protocols != nil &&
 		t.Protocols.UnencryptedHTTP2() &&
 		!t.Protocols.HTTP1()
+
+	if isClientConn && (unencryptedHTTP2 || (pconn.tlsState != nil && pconn.tlsState.NegotiatedProtocol == "h2")) {
+		altProto, _ := t.altProto.Load().(map[string]RoundTripper)
+		h2, ok := altProto["https"].(newClientConner)
+		if !ok {
+			return nil, errors.New("http: HTTP/2 implementation does not support NewClientConn (update golang.org/x/net?)")
+		}
+		alt, err := h2.NewClientConn(pconn.conn, internalStateHook)
+		if err != nil {
+			pconn.conn.Close()
+			return nil, err
+		}
+		return &persistConn{t: t, cacheKey: pconn.cacheKey, alt: alt, isClientConn: true}, nil
+	}
+
 	if unencryptedHTTP2 {
 		next, ok := t.TLSNextProto[nextProtoUnencryptedHTTP2]
 		if !ok {
@@ -2050,10 +2147,7 @@ func (cm *connectMethod) addr() string {
 // TLS certificate.
 func (cm *connectMethod) tlsHost() string {
 	h := cm.targetAddr
-	if hasPort(h) {
-		h = h[:strings.LastIndex(h, ":")]
-	}
-	return h
+	return removePort(h)
 }
 
 // connectMethodKey is the map key version of connectMethod, with a
@@ -2081,19 +2175,21 @@ type persistConn struct {
 	// If it's non-nil, the rest of the fields are unused.
 	alt RoundTripper
 
-	t         *Transport
-	cacheKey  connectMethodKey
-	conn      net.Conn
-	tlsState  *tls.ConnectionState
-	br        *bufio.Reader       // from conn
-	bw        *bufio.Writer       // to conn
-	nwrite    int64               // bytes written
-	reqch     chan requestAndChan // written by roundTrip; read by readLoop
-	writech   chan writeRequest   // written by roundTrip; read by writeLoop
-	closech   chan struct{}       // closed when conn closed
-	isProxy   bool
-	sawEOF    bool  // whether we've seen EOF from conn; owned by readLoop
-	readLimit int64 // bytes allowed to be read; owned by readLoop
+	t            *Transport
+	cacheKey     connectMethodKey
+	conn         net.Conn
+	tlsState     *tls.ConnectionState
+	br           *bufio.Reader       // from conn
+	bw           *bufio.Writer       // to conn
+	nwrite       int64               // bytes written
+	reqch        chan requestAndChan // written by roundTrip; read by readLoop
+	writech      chan writeRequest   // written by roundTrip; read by writeLoop
+	closech      chan struct{}       // closed when conn closed
+	availch      chan struct{}       // ClientConn only: contains a value when conn is usable
+	isProxy      bool
+	sawEOF       bool  // whether we've seen EOF from conn; owned by readLoop
+	isClientConn bool  // whether this is a ClientConn (outside any pool)
+	readLimit    int64 // bytes allowed to be read; owned by readLoop
 	// writeErrCh passes the request write error (usually nil)
 	// from the writeLoop goroutine to the readLoop which passes
 	// it off to the res.Body reader, which then uses it to decide
@@ -2108,10 +2204,13 @@ type persistConn struct {
 
 	mu                   sync.Mutex // guards following fields
 	numExpectedResponses int
-	closed               error // set non-nil when conn is closed, before closech is closed
-	canceledErr          error // set non-nil if conn is canceled
-	broken               bool  // an error has happened on this connection; marked broken so it's not reused.
-	reused               bool  // whether conn has had successful request/response and is being reused.
+	closed               error  // set non-nil when conn is closed, before closech is closed
+	canceledErr          error  // set non-nil if conn is canceled
+	reused               bool   // whether conn has had successful request/response and is being reused.
+	reserved             bool   // ClientConn only: concurrency slot reserved
+	inFlight             bool   // ClientConn only: request is in flight
+	internalStateHook    func() // ClientConn state hook
+
 	// mutateHeaderFunc is an optional func to modify extra
 	// headers on each outbound request before it's written. (the
 	// original Request given to RoundTrip is not modified)
@@ -2246,11 +2345,41 @@ func (pc *persistConn) mapRoundTripError(req *transportRequest, startBytesWritte
 // closing a net.Conn that is now owned by the caller.
 var errCallerOwnsConn = errors.New("read loop ending; caller owns writable underlying conn")
 
+// maxPostCloseReadBytes is the max number of bytes that a client is willing to
+// read when draining the response body of any unread bytes after it has been
+// closed. This number is chosen for consistency with maxPostHandlerReadBytes.
+const maxPostCloseReadBytes = 256 << 10
+
+// maxPostCloseReadTime defines the maximum amount of time that a client is
+// willing to spend on draining a response body of any unread bytes after it
+// has been closed.
+const maxPostCloseReadTime = 50 * time.Millisecond
+
+func maybeDrainBody(body io.Reader) bool {
+	drainedCh := make(chan bool, 1)
+	go func() {
+		if _, err := io.CopyN(io.Discard, body, maxPostCloseReadBytes+1); err == io.EOF {
+			drainedCh <- true
+		} else {
+			drainedCh <- false
+		}
+	}()
+	select {
+	case drained := <-drainedCh:
+		return drained
+	case <-time.After(maxPostCloseReadTime):
+		return false
+	}
+}
+
 func (pc *persistConn) readLoop() {
 	closeErr := errReadLoopExiting // default value, if not changed below
 	defer func() {
 		pc.close(closeErr)
 		pc.t.removeIdleConn(pc)
+		if pc.internalStateHook != nil {
+			pc.internalStateHook()
+		}
 	}()
 
 	tryPutIdleConn := func(treq *transportRequest) bool {
@@ -2404,12 +2533,17 @@ func (pc *persistConn) readLoop() {
 		// reading the response body. (or for cancellation or death)
 		select {
 		case bodyEOF := <-waitForBodyRead:
+			tryDrain := !bodyEOF && resp.ContentLength <= maxPostCloseReadBytes
+			if tryDrain {
+				eofc <- struct{}{}
+				bodyEOF = maybeDrainBody(body.body)
+			}
 			alive = alive &&
 				bodyEOF &&
 				!pc.sawEOF &&
 				pc.wroteRequest() &&
 				tryPutIdleConn(rc.treq)
-			if bodyEOF {
+			if !tryDrain && bodyEOF {
 				eofc <- struct{}{}
 			}
 		case <-rc.treq.ctx.Done():
@@ -2733,7 +2867,7 @@ var errTimeout error = &timeoutError{"net/http: timeout awaiting response header
 
 // errRequestCanceled is set to be identical to the one from h2 to facilitate
 // testing.
-var errRequestCanceled = http2errRequestCanceled
+var errRequestCanceled = internal.ErrRequestCanceled
 var errRequestCanceledConn = errors.New("net/http: request canceled while waiting for connection") // TODO: unify?
 
 // errRequestDone is used to cancel the round trip Context after a request is successfully done.
@@ -2754,9 +2888,32 @@ var (
 	testHookReadLoopBeforeNextRead             = nop
 )
 
+func (pc *persistConn) waitForAvailability(ctx context.Context) error {
+	select {
+	case <-pc.availch:
+		return nil
+	case <-pc.closech:
+		return pc.closed
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (pc *persistConn) roundTrip(req *transportRequest) (resp *Response, err error) {
 	testHookEnterRoundTrip()
+
 	pc.mu.Lock()
+	if pc.isClientConn {
+		if !pc.reserved {
+			pc.mu.Unlock()
+			if err := pc.waitForAvailability(req.ctx); err != nil {
+				return nil, err
+			}
+			pc.mu.Lock()
+		}
+		pc.reserved = false
+		pc.inFlight = true
+	}
 	pc.numExpectedResponses++
 	headerFn := pc.mutateHeaderFunc
 	pc.mu.Unlock()
@@ -2925,17 +3082,21 @@ func (pc *persistConn) closeLocked(err error) {
 	if err == nil {
 		panic("nil error")
 	}
-	pc.broken = true
 	if pc.closed == nil {
 		pc.closed = err
 		pc.t.decConnsPerHost(pc.cacheKey)
 		// Close HTTP/1 (pc.alt == nil) connection.
 		// HTTP/2 closes its connection itself.
+		// Close HTTP/3 connection if it implements io.Closer.
 		if pc.alt == nil {
 			if err != errCallerOwnsConn {
 				pc.conn.Close()
 			}
 			close(pc.closech)
+		} else {
+			if cc, ok := pc.alt.(io.Closer); ok {
+				cc.Close()
+			}
 		}
 	}
 	pc.mutateHeaderFunc = nil

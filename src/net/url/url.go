@@ -2,6 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:generate go run gen_encoding_table.go
+
 // Package url parses URLs and implements query escaping.
 //
 // See RFC 3986. This package generally follows RFC 3986, except where
@@ -15,6 +17,7 @@ package url
 import (
 	"errors"
 	"fmt"
+	"internal/godebug"
 	"net/netip"
 	"path"
 	"slices"
@@ -22,6 +25,8 @@ import (
 	"strings"
 	_ "unsafe" // for linkname
 )
+
+var urlstrictcolons = godebug.New("urlstrictcolons")
 
 // Error reports an error and the operation and URL that caused it.
 type Error struct {
@@ -50,41 +55,13 @@ func (e *Error) Temporary() bool {
 const upperhex = "0123456789ABCDEF"
 
 func ishex(c byte) bool {
-	switch {
-	case '0' <= c && c <= '9':
-		return true
-	case 'a' <= c && c <= 'f':
-		return true
-	case 'A' <= c && c <= 'F':
-		return true
-	}
-	return false
+	return table[c]&hexChar != 0
 }
 
+// Precondition: ishex(c) is true.
 func unhex(c byte) byte {
-	switch {
-	case '0' <= c && c <= '9':
-		return c - '0'
-	case 'a' <= c && c <= 'f':
-		return c - 'a' + 10
-	case 'A' <= c && c <= 'F':
-		return c - 'A' + 10
-	default:
-		panic("invalid hex character")
-	}
+	return 9*(c>>6) + (c & 15)
 }
-
-type encoding int
-
-const (
-	encodePath encoding = 1 + iota
-	encodePathSegment
-	encodeHost
-	encodeZone
-	encodeUserPassword
-	encodeQueryComponent
-	encodeFragment
-)
 
 type EscapeError string
 
@@ -98,86 +75,9 @@ func (e InvalidHostError) Error() string {
 	return "invalid character " + strconv.Quote(string(e)) + " in host name"
 }
 
-// Return true if the specified character should be escaped when
-// appearing in a URL string, according to RFC 3986.
-//
-// Please be informed that for now shouldEscape does not check all
-// reserved characters correctly. See golang.org/issue/5684.
+// See the reference implementation in gen_encoding_table.go.
 func shouldEscape(c byte, mode encoding) bool {
-	// §2.3 Unreserved characters (alphanum)
-	if 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9' {
-		return false
-	}
-
-	if mode == encodeHost || mode == encodeZone {
-		// §3.2.2 Host allows
-		//	sub-delims = "!" / "$" / "&" / "'" / "(" / ")" / "*" / "+" / "," / ";" / "="
-		// as part of reg-name.
-		// We add : because we include :port as part of host.
-		// We add [ ] because we include [ipv6]:port as part of host.
-		// We add < > because they're the only characters left that
-		// we could possibly allow, and Parse will reject them if we
-		// escape them (because hosts can't use %-encoding for
-		// ASCII bytes).
-		switch c {
-		case '!', '$', '&', '\'', '(', ')', '*', '+', ',', ';', '=', ':', '[', ']', '<', '>', '"':
-			return false
-		}
-	}
-
-	switch c {
-	case '-', '_', '.', '~': // §2.3 Unreserved characters (mark)
-		return false
-
-	case '$', '&', '+', ',', '/', ':', ';', '=', '?', '@': // §2.2 Reserved characters (reserved)
-		// Different sections of the URL allow a few of
-		// the reserved characters to appear unescaped.
-		switch mode {
-		case encodePath: // §3.3
-			// The RFC allows : @ & = + $ but saves / ; , for assigning
-			// meaning to individual path segments. This package
-			// only manipulates the path as a whole, so we allow those
-			// last three as well. That leaves only ? to escape.
-			return c == '?'
-
-		case encodePathSegment: // §3.3
-			// The RFC allows : @ & = + $ but saves / ; , for assigning
-			// meaning to individual path segments.
-			return c == '/' || c == ';' || c == ',' || c == '?'
-
-		case encodeUserPassword: // §3.2.1
-			// The RFC allows ';', ':', '&', '=', '+', '$', and ',' in
-			// userinfo, so we must escape only '@', '/', and '?'.
-			// The parsing of userinfo treats ':' as special so we must escape
-			// that too.
-			return c == '@' || c == '/' || c == '?' || c == ':'
-
-		case encodeQueryComponent: // §3.4
-			// The RFC reserves (so we must escape) everything.
-			return true
-
-		case encodeFragment: // §4.1
-			// The RFC text is silent but the grammar allows
-			// everything, so escape nothing.
-			return false
-		}
-	}
-
-	if mode == encodeFragment {
-		// RFC 3986 §2.2 allows not escaping sub-delims. A subset of sub-delims are
-		// included in reserved from RFC 2396 §2.2. The remaining sub-delims do not
-		// need to be escaped. To minimize potential breakage, we apply two restrictions:
-		// (1) we always escape sub-delims outside of the fragment, and (2) we always
-		// escape single quote to avoid breaking callers that had previously assumed that
-		// single quotes would be escaped. See issue #19917.
-		switch c {
-		case '!', '(', ')', '*':
-			return false
-		}
-	}
-
-	// Everything else must be escaped.
-	return true
+	return table[c]&mode == 0
 }
 
 // QueryUnescape does the inverse transformation of [QueryEscape],
@@ -255,19 +155,24 @@ func unescape(s string, mode encoding) (string, error) {
 		return s, nil
 	}
 
+	var unescapedPlusSign byte
+	switch mode {
+	case encodeQueryComponent:
+		unescapedPlusSign = ' '
+	default:
+		unescapedPlusSign = '+'
+	}
 	var t strings.Builder
 	t.Grow(len(s) - 2*n)
 	for i := 0; i < len(s); i++ {
 		switch s[i] {
 		case '%':
+			// In the loop above, we established that unhex's precondition is
+			// fulfilled for both s[i+1] and s[i+2].
 			t.WriteByte(unhex(s[i+1])<<4 | unhex(s[i+2]))
 			i += 2
 		case '+':
-			if mode == encodeQueryComponent {
-				t.WriteByte(' ')
-			} else {
-				t.WriteByte('+')
-			}
+			t.WriteByte(unescapedPlusSign)
 		default:
 			t.WriteByte(s[i])
 		}
@@ -289,8 +194,7 @@ func PathEscape(s string) string {
 
 func escape(s string, mode encoding) string {
 	spaceCount, hexCount := 0, 0
-	for i := 0; i < len(s); i++ {
-		c := s[i]
+	for _, c := range []byte(s) {
 		if shouldEscape(c, mode) {
 			if c == ' ' && mode == encodeQueryComponent {
 				spaceCount++
@@ -325,8 +229,8 @@ func escape(s string, mode encoding) string {
 	}
 
 	j := 0
-	for i := 0; i < len(s); i++ {
-		switch c := s[i]; {
+	for _, c := range []byte(s) {
+		switch {
 		case c == ' ' && mode == encodeQueryComponent:
 			t[j] = '+'
 			j++
@@ -336,7 +240,7 @@ func escape(s string, mode encoding) string {
 			t[j+2] = upperhex[c&15]
 			j += 3
 		default:
-			t[j] = s[i]
+			t[j] = c
 			j++
 		}
 	}
@@ -584,7 +488,7 @@ func parse(rawURL string, viaRequest bool) (*URL, error) {
 		if i := strings.Index(authority, "/"); i >= 0 {
 			authority, rest = authority[:i], authority[i:]
 		}
-		url.User, url.Host, err = parseAuthority(authority)
+		url.User, url.Host, err = parseAuthority(url.Scheme, authority)
 		if err != nil {
 			return nil, err
 		}
@@ -604,12 +508,12 @@ func parse(rawURL string, viaRequest bool) (*URL, error) {
 	return url, nil
 }
 
-func parseAuthority(authority string) (user *Userinfo, host string, err error) {
+func parseAuthority(scheme, authority string) (user *Userinfo, host string, err error) {
 	i := strings.LastIndex(authority, "@")
 	if i < 0 {
-		host, err = parseHost(authority)
+		host, err = parseHost(scheme, authority)
 	} else {
-		host, err = parseHost(authority[i+1:])
+		host, err = parseHost(scheme, authority[i+1:])
 	}
 	if err != nil {
 		return nil, "", err
@@ -641,8 +545,10 @@ func parseAuthority(authority string) (user *Userinfo, host string, err error) {
 
 // parseHost parses host as an authority without user
 // information. That is, as host[:port].
-func parseHost(host string) (string, error) {
-	if openBracketIdx := strings.LastIndex(host, "["); openBracketIdx != -1 {
+func parseHost(scheme, host string) (string, error) {
+	if openBracketIdx := strings.LastIndex(host, "["); openBracketIdx > 0 {
+		return "", errors.New("invalid IP-literal")
+	} else if openBracketIdx == 0 {
 		// Parse an IP-Literal in RFC 3986 and RFC 6874.
 		// E.g., "[fe80::1]", "[fe80::1%25en0]", "[fe80::1]:80".
 		closeBracketIdx := strings.LastIndex(host, "]")
@@ -697,7 +603,28 @@ func parseHost(host string) (string, error) {
 			return "", errors.New("invalid IP-literal")
 		}
 		return "[" + unescapedHostname + "]" + unescapedColonPort, nil
-	} else if i := strings.LastIndex(host, ":"); i != -1 {
+	} else if i := strings.Index(host, ":"); i != -1 {
+		lastColon := strings.LastIndex(host, ":")
+		if lastColon != i {
+			// RFC 3986 does not allow colons to appear in the host subcomponent.
+			//
+			// However, a number of databases including PostgreSQL and MongoDB
+			// permit a comma-separated list of hosts (with optional ports) in the
+			// host subcomponent.
+			//
+			// Since we historically permitted colons to appear in the host,
+			// enforce strict colons only for http and https URLs.
+			//
+			// See https://go.dev/issue/75223 and https://go.dev/issue/78077.
+			if scheme == "http" || scheme == "https" {
+				if urlstrictcolons.Value() == "0" {
+					urlstrictcolons.IncNonDefault()
+					i = lastColon
+				}
+			} else {
+				i = lastColon
+			}
+		}
 		colonPort := host[i:]
 		if !validOptionalPort(colonPort) {
 			return "", fmt.Errorf("invalid port %q after host", colonPort)
@@ -909,6 +836,13 @@ func (u *URL) String() string {
 			}
 		}
 		path := u.EscapedPath()
+		if u.OmitHost && u.Host == "" && u.User == nil && strings.HasPrefix(path, "//") {
+			// Escape the first / in a path starting with "//" and no authority
+			// so that re-parsing the URL doesn't turn the path into an authority
+			// (e.g., Path="//host/p" producing "http://host/p").
+			buf.WriteString("%2F")
+			path = path[1:]
+		}
 		if path != "" && path[0] != '/' && u.Host != "" {
 			buf.WriteByte('/')
 		}
@@ -991,6 +925,19 @@ func (v Values) Has(key string) bool {
 	return ok
 }
 
+// Clone creates a deep copy of the subject [Values].
+func (vs Values) Clone() Values {
+	if vs == nil {
+		return nil
+	}
+
+	newVals := make(Values, len(vs))
+	for k, v := range vs {
+		newVals[k] = slices.Clone(v)
+	}
+	return newVals
+}
+
 // ParseQuery parses the URL-encoded query string and returns
 // a map listing the values specified for each key.
 // ParseQuery always returns a non-nil map containing all the
@@ -1007,7 +954,30 @@ func ParseQuery(query string) (Values, error) {
 	return m, err
 }
 
+var urlmaxqueryparams = godebug.New("urlmaxqueryparams")
+
+const defaultMaxParams = 10000
+
+func urlParamsWithinMax(params int) bool {
+	withinDefaultMax := params <= defaultMaxParams
+	if urlmaxqueryparams.Value() == "" {
+		return withinDefaultMax
+	}
+	customMax, err := strconv.Atoi(urlmaxqueryparams.Value())
+	if err != nil {
+		return withinDefaultMax
+	}
+	withinCustomMax := customMax == 0 || params < customMax
+	if withinDefaultMax != withinCustomMax {
+		urlmaxqueryparams.IncNonDefault()
+	}
+	return withinCustomMax
+}
+
 func parseQuery(m Values, query string) (err error) {
+	if !urlParamsWithinMax(strings.Count(query, "&") + 1) {
+		return errors.New("number of URL query parameters exceeded limit")
+	}
 	for query != "" {
 		var key string
 		key, query, _ = strings.Cut(query, "&")
@@ -1283,7 +1253,13 @@ func (u *URL) UnmarshalBinary(text []byte) error {
 // JoinPath returns a new [URL] with the provided path elements joined to
 // any existing path and the resulting path cleaned of any ./ or ../ elements.
 // Any sequences of multiple / characters will be reduced to a single /.
+// Path elements must already be in escaped form, as produced by [PathEscape].
 func (u *URL) JoinPath(elem ...string) *URL {
+	url, _ := u.joinPath(elem...)
+	return url
+}
+
+func (u *URL) joinPath(elem ...string) (*URL, error) {
 	elem = append([]string{u.EscapedPath()}, elem...)
 	var p string
 	if !strings.HasPrefix(elem[0], "/") {
@@ -1300,8 +1276,8 @@ func (u *URL) JoinPath(elem ...string) *URL {
 		p += "/"
 	}
 	url := *u
-	url.setPath(p)
-	return &url
+	err := url.setPath(p)
+	return &url, err
 }
 
 // validUserinfo reports whether s is a valid userinfo string per RFC 3986
@@ -1359,11 +1335,28 @@ func stringContainsCTLByte(s string) bool {
 
 // JoinPath returns a [URL] string with the provided path elements joined to
 // the existing path of base and the resulting path cleaned of any ./ or ../ elements.
+// Path elements must already be in escaped form, as produced by [PathEscape].
 func JoinPath(base string, elem ...string) (result string, err error) {
 	url, err := Parse(base)
 	if err != nil {
 		return
 	}
-	result = url.JoinPath(elem...).String()
-	return
+	res, err := url.joinPath(elem...)
+	if err != nil {
+		return "", err
+	}
+	return res.String(), nil
+}
+
+// Clone creates a deep copy of the fields of the subject [URL].
+func (u *URL) Clone() *URL {
+	if u == nil {
+		return nil
+	}
+
+	uc := new(*u)
+	if u.User != nil {
+		uc.User = new(*u.User)
+	}
+	return uc
 }

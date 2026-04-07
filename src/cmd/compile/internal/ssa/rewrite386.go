@@ -257,6 +257,9 @@ func rewriteValue386(v *Value) bool {
 	case OpAdd32carry:
 		v.Op = Op386ADDLcarry
 		return true
+	case OpAdd32carrywithcarry:
+		v.Op = Op386ADCLcarry
+		return true
 	case OpAdd32withcarry:
 		v.Op = Op386ADCL
 		return true
@@ -688,6 +691,9 @@ func rewriteValue386(v *Value) bool {
 		return true
 	case OpTailCall:
 		v.Op = Op386CALLtail
+		return true
+	case OpTailCallInter:
+		v.Op = Op386CALLtailinter
 		return true
 	case OpTrunc16to8:
 		v.Op = OpCopy

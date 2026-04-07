@@ -6,6 +6,7 @@
 (Add(32|64)F ...) => (ADD(F|D) ...)
 (Add32carry ...) => (ADDS ...)
 (Add32withcarry ...) => (ADC ...)
+(Add32carrywithcarry ...) => (ADCS ...)
 
 (Sub(Ptr|32|16|8) ...) => (SUB ...)
 (Sub(32|64)F ...) => (SUB(F|D) ...)
@@ -354,6 +355,7 @@
 (ClosureCall ...) => (CALLclosure ...)
 (InterCall ...) => (CALLinter ...)
 (TailCall ...) => (CALLtail ...)
+(TailCallInter ...) => (CALLtailinter ...)
 
 // checks
 (NilCheck ...) => (LoweredNilCheck ...)

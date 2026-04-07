@@ -206,7 +206,7 @@ func (c *Conf) Fun(entry string, blocs ...bloc) fun {
 // Bloc defines a block for Fun. The bloc name should be unique
 // across the containing Fun. entries should consist of calls to valu,
 // as well as one call to Goto, If, or Exit to specify the block kind.
-func Bloc(name string, entries ...interface{}) bloc {
+func Bloc(name string, entries ...any) bloc {
 	b := bloc{}
 	b.name = name
 	seenCtrl := false
@@ -258,6 +258,11 @@ func Ret(arg string) ctrl {
 // Eq specifies a BlockAMD64EQ.
 func Eq(cond, sub, alt string) ctrl {
 	return ctrl{BlockAMD64EQ, cond, []string{sub, alt}}
+}
+
+// Lt specifies a BlockAMD64LT.
+func Lt(cond, yes, no string) ctrl {
+	return ctrl{BlockAMD64LT, cond, []string{yes, no}}
 }
 
 // bloc, ctrl, and valu are internal structures used by Bloc, Valu, Goto,

@@ -112,6 +112,11 @@ type File struct {
 	infos []lineInfo
 }
 
+// String returns a brief description of the File.
+func (f *File) String() string {
+	return fmt.Sprintf("%s(%d-%d)", f.Name(), f.Base(), f.End())
+}
+
 // Name returns the file name of file f as registered with AddFile.
 func (f *File) Name() string {
 	return f.name
@@ -125,6 +130,11 @@ func (f *File) Base() int {
 // Size returns the size of file f as registered with AddFile.
 func (f *File) Size() int {
 	return f.size
+}
+
+// End returns the end position of file f as registered with AddFile.
+func (f *File) End() Pos {
+	return Pos(f.base + f.size)
 }
 
 // LineCount returns the number of lines in file f.
@@ -271,26 +281,12 @@ func (f *File) AddLineColumnInfo(offset int, filename string, line, column int) 
 
 // fixOffset fixes an out-of-bounds offset such that 0 <= offset <= f.size.
 func (f *File) fixOffset(offset int) int {
-	switch {
-	case offset < 0:
-		if !debug {
-			return 0
-		}
-	case offset > f.size:
-		if !debug {
-			return f.size
-		}
-	default:
-		return offset
-	}
-
-	// only generate this code if needed
-	if debug {
+	if debug && !(0 <= offset && offset <= f.size) {
 		panic(fmt.Sprintf("offset %d out of bounds [%d, %d] (position %d out of bounds [%d, %d])",
 			0 /* for symmetry */, offset, f.size,
 			f.base+offset, f.base, f.base+f.size))
 	}
-	return 0
+	return max(min(f.size, offset), 0)
 }
 
 // Pos returns the Pos value for the given file offset.
@@ -511,7 +507,7 @@ func (s *FileSet) AddExistingFiles(files ...*File) {
 	//	}
 	//
 	// because all calls to AddFile must be in increasing order.
-	// AddExistingFilesFiles lets us augment an existing FileSet
+	// AddExistingFiles lets us augment an existing FileSet
 	// sequentially, so long as all sets of files have disjoint ranges.
 	// This approach also does not preserve line directives.
 

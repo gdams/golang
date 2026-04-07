@@ -1,21 +1,21 @@
 module cmd
 
-go 1.26
+go 1.27
 
 require (
-	github.com/google/pprof v0.0.0-20250630185457-6e76a2b096b5
-	golang.org/x/arch v0.20.1-0.20250808194827-46ba08e3ae58
-	golang.org/x/build v0.0.0-20250806225920-b7c66c047964
-	golang.org/x/mod v0.29.0
-	golang.org/x/sync v0.17.0
-	golang.org/x/sys v0.37.0
-	golang.org/x/telemetry v0.0.0-20251008203120-078029d740a8
-	golang.org/x/term v0.34.0
-	golang.org/x/tools v0.38.1-0.20251015192825-7d9453ccc0f5
+	github.com/google/pprof v0.0.0-20260115054156-294ebfa9ad83
+	golang.org/x/arch v0.23.1-0.20260109160903-657d90bd6695
+	golang.org/x/build v0.0.0-20260122183339-3ba88df37c64
+	golang.org/x/mod v0.34.0
+	golang.org/x/sync v0.20.0
+	golang.org/x/sys v0.42.1-0.20260320201212-a76ec62d6c53
+	golang.org/x/telemetry v0.0.0-20260311193753-579e4da9a98c
+	golang.org/x/term v0.39.0
+	golang.org/x/tools v0.43.1-0.20260406190732-b36d1d12a1a7
 )
 
 require (
 	github.com/ianlancetaylor/demangle v0.0.0-20250417193237-f615e6bd150b // indirect
-	golang.org/x/text v0.30.0 // indirect
+	golang.org/x/text v0.33.1-0.20260122225119-3264de9174be // indirect
 	rsc.io/markdown v0.0.0-20240306144322-0bf8f97ee8ef // indirect
 )

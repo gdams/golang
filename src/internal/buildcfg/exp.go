@@ -65,6 +65,8 @@ func ParseGOEXPERIMENT(goos, goarch, goexp string) (*ExperimentFlags, error) {
 	case "amd64", "arm64", "loong64", "ppc64le", "ppc64", "riscv64":
 		regabiAlwaysOn = true
 		regabiSupported = true
+	case "s390x":
+		regabiSupported = true
 	}
 
 	// Older versions (anything before V16) of dsymutil don't handle
@@ -79,15 +81,12 @@ func ParseGOEXPERIMENT(goos, goarch, goexp string) (*ExperimentFlags, error) {
 	dwarf5Supported := (goos != "darwin" && goos != "ios" && goos != "aix")
 
 	baseline := goexperiment.Flags{
-		RegabiWrappers:        regabiSupported,
-		RegabiArgs:            regabiSupported,
-		Dwarf5:                dwarf5Supported,
-		RandomizedHeapBase64:  true,
-		SizeSpecializedMalloc: true,
-		GreenTeaGC:            true,
+		RegabiWrappers:       regabiSupported,
+		RegabiArgs:           regabiSupported,
+		Dwarf5:               dwarf5Supported,
+		RandomizedHeapBase64: true,
+		GreenTeaGC:           true,
 	}
-
-	// Start with the statically enabled set of experiments.
 	flags := &ExperimentFlags{
 		Flags:    baseline,
 		baseline: baseline,
@@ -143,7 +142,7 @@ func ParseGOEXPERIMENT(goos, goarch, goexp string) (*ExperimentFlags, error) {
 		flags.RegabiWrappers = true
 		flags.RegabiArgs = true
 	}
-	// regabi is only supported on amd64, arm64, loong64, riscv64, ppc64 and ppc64le.
+	// regabi is only supported on amd64, arm64, loong64, riscv64, s390x, ppc64 and ppc64le.
 	if !regabiSupported {
 		flags.RegabiWrappers = false
 		flags.RegabiArgs = false

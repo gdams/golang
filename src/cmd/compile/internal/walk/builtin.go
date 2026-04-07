@@ -136,17 +136,18 @@ func walkGrowslice(slice *ir.Name, init *ir.Nodes, oldPtr, newLen, oldCap, num i
 }
 
 // walkClear walks an OCLEAR node.
-func walkClear(n *ir.UnaryExpr) ir.Node {
+func walkClear(n *ir.UnaryExpr, init *ir.Nodes) ir.Node {
+	x := walkExpr(n.X, init)
 	typ := n.X.Type()
 	switch {
 	case typ.IsSlice():
-		if n := arrayClear(n.X.Pos(), n.X, nil); n != nil {
+		if n := arrayClear(x.Pos(), x, nil); n != nil {
 			return n
 		}
 		// If n == nil, we are clearing an array which takes zero memory, do nothing.
 		return ir.NewBlockStmt(n.Pos(), nil)
 	case typ.IsMap():
-		return mapClear(n.X, reflectdata.TypePtrAt(n.X.Pos(), n.X.Type()))
+		return mapClear(x, reflectdata.TypePtrAt(x.Pos(), typ))
 	}
 	panic("unreachable")
 }
@@ -455,7 +456,7 @@ func walkMakeSlice(n *ir.MakeExpr, init *ir.Nodes) ir.Node {
 			niflen := ir.NewIfStmt(base.Pos, ir.NewBinaryExpr(base.Pos, ir.OLT, len, ir.NewInt(base.Pos, 0)), nil, nil)
 			niflen.Body = []ir.Node{mkcall("panicmakeslicelen", nil, init)}
 			nif.Body.Append(niflen, mkcall("panicmakeslicecap", nil, init))
-			init.Append(typecheck.Stmt(nif))
+			appendWalkStmt(init, nif)
 
 			// var arr [cap]E
 			// s = arr[:len]
@@ -714,10 +715,14 @@ func walkPrint(nn *ir.CallExpr, init *ir.Nodes) ir.Node {
 			}
 		case types.TINT, types.TINT8, types.TINT16, types.TINT32, types.TINT64:
 			on = typecheck.LookupRuntime("printint")
-		case types.TFLOAT32, types.TFLOAT64:
-			on = typecheck.LookupRuntime("printfloat")
-		case types.TCOMPLEX64, types.TCOMPLEX128:
-			on = typecheck.LookupRuntime("printcomplex")
+		case types.TFLOAT32:
+			on = typecheck.LookupRuntime("printfloat32")
+		case types.TFLOAT64:
+			on = typecheck.LookupRuntime("printfloat64")
+		case types.TCOMPLEX64:
+			on = typecheck.LookupRuntime("printcomplex64")
+		case types.TCOMPLEX128:
+			on = typecheck.LookupRuntime("printcomplex128")
 		case types.TBOOL:
 			on = typecheck.LookupRuntime("printbool")
 		case types.TSTRING:
@@ -725,13 +730,18 @@ func walkPrint(nn *ir.CallExpr, init *ir.Nodes) ir.Node {
 			if ir.IsConst(n, constant.String) {
 				cs = ir.StringVal(n)
 			}
-			switch cs {
-			case " ":
-				on = typecheck.LookupRuntime("printsp")
-			case "\n":
-				on = typecheck.LookupRuntime("printnl")
-			default:
-				on = typecheck.LookupRuntime("printstring")
+			// Print values of the named type `quoted` using printquoted.
+			if types.RuntimeSymName(n.Type().Sym()) == "quoted" {
+				on = typecheck.LookupRuntime("printquoted")
+			} else {
+				switch cs {
+				case " ":
+					on = typecheck.LookupRuntime("printsp")
+				case "\n":
+					on = typecheck.LookupRuntime("printnl")
+				default:
+					on = typecheck.LookupRuntime("printstring")
+				}
 			}
 		default:
 			badtype(ir.OPRINT, n.Type(), nil)

@@ -32,7 +32,11 @@ import (
 	"golang.org/x/crypto/cryptobyte"
 )
 
-const boringsslModVer = "v0.0.0-20250620172916-f51d8b099832"
+// boringsslModVer is the version of BoringSSL that we test against.
+// The pseudo-version can be found by executing:
+//
+//	go mod download -json boringssl.googlesource.com/boringssl.git@latest
+const boringsslModVer = "v0.0.0-20260209204302-2a7ca5404e13"
 
 var (
 	port   = flag.String("port", "", "")
@@ -461,7 +465,7 @@ func bogoShim() {
 			}
 
 			if *expectVersion != 0 && cs.Version != uint16(*expectVersion) {
-				log.Fatalf("expected ssl version %q, got %q", uint16(*expectVersion), cs.Version)
+				log.Fatalf("expected ssl version %d, got %d", *expectVersion, cs.Version)
 			}
 			if *declineALPN && cs.NegotiatedProtocol != "" {
 				log.Fatal("unexpected ALPN protocol")
@@ -476,11 +480,11 @@ func bogoShim() {
 				log.Fatal("did not expect ECH, but it was accepted")
 			}
 
-			if *expectHRR && !cs.testingOnlyDidHRR {
+			if *expectHRR && !cs.HelloRetryRequest {
 				log.Fatal("expected HRR but did not do it")
 			}
 
-			if *expectNoHRR && cs.testingOnlyDidHRR {
+			if *expectNoHRR && cs.HelloRetryRequest {
 				log.Fatal("expected no HRR but did do it")
 			}
 
@@ -542,7 +546,6 @@ func orderlyShutdown(tlsConn *Conn) {
 }
 
 func TestBogoSuite(t *testing.T) {
-	testenv.MustHaveGoBuild(t)
 	if testing.Short() {
 		t.Skip("skipping in short mode")
 	}
@@ -578,7 +581,7 @@ func TestBogoSuite(t *testing.T) {
 		"test",
 		".",
 		fmt.Sprintf("-shim-config=%s", filepath.Join(cwd, "bogo_config.json")),
-		fmt.Sprintf("-shim-path=%s", os.Args[0]),
+		fmt.Sprintf("-shim-path=%s", testenv.Executable(t)),
 		"-shim-extra-flags=-bogo-mode",
 		"-allow-unimplemented",
 		"-loose-errors", // TODO(roland): this should be removed eventually
@@ -589,10 +592,8 @@ func TestBogoSuite(t *testing.T) {
 	}
 
 	cmd := testenv.Command(t, testenv.GoToolPath(t), args...)
-	out := &strings.Builder{}
-	cmd.Stderr = out
 	cmd.Dir = filepath.Join(bogoDir, "ssl/test/runner")
-	err = cmd.Run()
+	out, err := cmd.CombinedOutput()
 	// NOTE: we don't immediately check the error, because the failure could be either because
 	// the runner failed for some unexpected reason, or because a test case failed, and we
 	// cannot easily differentiate these cases. We check if the JSON results file was written,
@@ -622,8 +623,8 @@ func TestBogoSuite(t *testing.T) {
 	// are present in the output. They are only checked if -bogo-filter
 	// was not passed.
 	assertResults := map[string]string{
-		"CurveTest-Client-MLKEM-TLS13": "PASS",
-		"CurveTest-Server-MLKEM-TLS13": "PASS",
+		"CurveTest-Client-X25519MLKEM768-TLS13": "PASS",
+		"CurveTest-Server-X25519MLKEM768-TLS13": "PASS",
 
 		// Various signature algorithm tests checking that we enforce our
 		// preferences on the peer.
@@ -707,7 +708,6 @@ func ensureLocalBogo(t *testing.T, localBogoDir string) {
 	}
 
 	t.Logf("using fresh local bogo checkout from %q", localBogoDir)
-	return
 }
 
 func generateReport(results bogoResults, outPath string) error {

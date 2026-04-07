@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 
 	"cmd/compile/internal/base"
@@ -183,7 +184,7 @@ var BasicTypeNames = []string{
 }
 
 var fmtBufferPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return new(bytes.Buffer)
 	},
 }
@@ -635,6 +636,16 @@ func SplitVargenSuffix(name string) (base, suffix string) {
 	const dot = "·"
 	if i >= len(dot) && name[i-len(dot):i] == dot {
 		i -= len(dot)
+		return name[:i], name[i:]
+	}
+	return name, ""
+}
+
+// SplitMethSuffix returns name split into a defining type name and a .m
+// suffix, if any.
+func SplitMethSuffix(name string) (tname, suffix string) {
+	i := strings.LastIndex(name, ".")
+	if i >= 0 {
 		return name[:i], name[i:]
 	}
 	return name, ""

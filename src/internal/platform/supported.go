@@ -89,11 +89,6 @@ func MustLinkExternal(goos, goarch string, withCgo bool) bool {
 			// Internally linking cgo is incomplete on some architectures.
 			// https://go.dev/issue/14449
 			return true
-		case "arm64":
-			if goos == "windows" {
-				// windows/arm64 internal linking is not implemented.
-				return true
-			}
 		case "ppc64":
 			// Big Endian PPC64 cgo internal linking is not implemented for aix or linux.
 			// https://go.dev/issue/8912
@@ -225,7 +220,7 @@ func InternalLinkPIESupported(goos, goarch string) bool {
 	switch goos + "/" + goarch {
 	case "android/arm64",
 		"darwin/amd64", "darwin/arm64",
-		"linux/amd64", "linux/arm64", "linux/loong64", "linux/ppc64le",
+		"linux/amd64", "linux/arm64", "linux/loong64", "linux/ppc64le", "linux/s390x",
 		"windows/386", "windows/amd64", "windows/arm64":
 		return true
 	}

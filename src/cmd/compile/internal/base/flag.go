@@ -78,6 +78,7 @@ type CmdFlags struct {
 	LowerR CountFlag  "help:\"debug generated wrappers\""
 	LowerT bool       "help:\"enable tracing for debugging the compiler\""
 	LowerW CountFlag  "help:\"debug type checking\""
+	LowerU CountFlag  "help:\"emit unsorted warnings/errors\""
 	LowerV *bool      "help:\"increase debug verbosity\""
 
 	// Special characters
@@ -177,10 +178,12 @@ func ParseFlags() {
 	Flag.WB = true
 
 	Debug.ConcurrentOk = true
+	Debug.CompressInstructions = 1
 	Debug.MaxShapeLen = 500
 	Debug.AlignHot = 1
 	Debug.InlFuncsWithClosures = 1
 	Debug.InlStaticInit = 1
+	Debug.FreeAppend = 1
 	Debug.PGOInline = 1
 	Debug.PGODevirtualize = 2
 	Debug.SyncFrames = -1            // disable sync markers by default
@@ -299,6 +302,7 @@ func ParseFlags() {
 	}
 	parseSpectre(Flag.Spectre) // left as string for RecordFlags
 
+	Ctxt.CompressInstructions = Debug.CompressInstructions != 0
 	Ctxt.Flag_shared = Ctxt.Flag_dynlink || Ctxt.Flag_shared
 	Ctxt.Flag_optimize = Flag.N == 0
 	Ctxt.Debugasm = int(Flag.S)
@@ -471,7 +475,6 @@ func concurrentFlagOk() bool {
 		Flag.E == 0 &&
 		Flag.K == 0 &&
 		Flag.L == 0 &&
-		Flag.LowerH == 0 &&
 		Flag.LowerJ == 0 &&
 		Flag.LowerM == 0 &&
 		Flag.LowerR == 0

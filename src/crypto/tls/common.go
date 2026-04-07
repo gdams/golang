@@ -22,6 +22,7 @@ import (
 	"internal/godebug"
 	"io"
 	"net"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -145,19 +146,31 @@ const (
 type CurveID uint16
 
 const (
-	CurveP256      CurveID = 23
-	CurveP384      CurveID = 24
-	CurveP521      CurveID = 25
-	X25519         CurveID = 29
-	X25519MLKEM768 CurveID = 4588
+	CurveP256          CurveID = 23
+	CurveP384          CurveID = 24
+	CurveP521          CurveID = 25
+	X25519             CurveID = 29
+	X25519MLKEM768     CurveID = 4588
+	SecP256r1MLKEM768  CurveID = 4587
+	SecP384r1MLKEM1024 CurveID = 4589
 )
 
 func isTLS13OnlyKeyExchange(curve CurveID) bool {
-	return curve == X25519MLKEM768
+	switch curve {
+	case X25519MLKEM768, SecP256r1MLKEM768, SecP384r1MLKEM1024:
+		return true
+	default:
+		return false
+	}
 }
 
 func isPQKeyExchange(curve CurveID) bool {
-	return curve == X25519MLKEM768
+	switch curve {
+	case X25519MLKEM768, SecP256r1MLKEM768, SecP384r1MLKEM1024:
+		return true
+	default:
+		return false
+	}
 }
 
 // TLS 1.3 Key Share. See RFC 8446, Section 4.2.8.
@@ -304,11 +317,12 @@ type ConnectionState struct {
 	// client side.
 	ECHAccepted bool
 
+	// HelloRetryRequest indicates whether we sent a HelloRetryRequest if we
+	// are a server, or if we received a HelloRetryRequest if we are a client.
+	HelloRetryRequest bool
+
 	// ekm is a closure exposed via ExportKeyingMaterial.
 	ekm func(label string, context []byte, length int) ([]byte, error)
-
-	// testingOnlyDidHRR is true if a HelloRetryRequest was sent/received.
-	testingOnlyDidHRR bool
 
 	// testingOnlyPeerSignatureAlgorithm is the signature algorithm used by the
 	// peer to sign the handshake. It is not set for resumed connections.
@@ -469,6 +483,10 @@ type ClientHelloInfo struct {
 	// connection to fail.
 	Conn net.Conn
 
+	// HelloRetryRequest indicates whether the ClientHello was sent in response
+	// to a HelloRetryRequest message.
+	HelloRetryRequest bool
+
 	// config is embedded by the GetCertificate or GetConfigForClient caller,
 	// for use with SupportsCertificate.
 	config *Config
@@ -615,10 +633,13 @@ type Config struct {
 	// If GetConfigForClient is nil, the Config passed to Server() will be
 	// used for all connections.
 	//
-	// If SessionTicketKey was explicitly set on the returned Config, or if
-	// SetSessionTicketKeys was called on the returned Config, those keys will
+	// If SessionTicketKey is explicitly set on the returned Config, or if
+	// SetSessionTicketKeys is called on the returned Config, those keys will
 	// be used. Otherwise, the original Config keys will be used (and possibly
-	// rotated if they are automatically managed).
+	// rotated if they are automatically managed). WARNING: this allows session
+	// resumtion of connections originally established with the parent (or a
+	// sibling) Config, which may bypass the [Config.VerifyPeerCertificate]
+	// value of the returned Config.
 	GetConfigForClient func(*ClientHelloInfo) (*Config, error)
 
 	// VerifyPeerCertificate, if not nil, is called after normal
@@ -636,8 +657,10 @@ type Config struct {
 	// rawCerts may be empty on the server if ClientAuth is RequestClientCert or
 	// VerifyClientCertIfGiven.
 	//
-	// This callback is not invoked on resumed connections, as certificates are
-	// not re-verified on resumption.
+	// This callback is not invoked on resumed connections. WARNING: this
+	// includes connections resumed across Configs returned by [Config.Clone] or
+	// [Config.GetConfigForClient] and their parents. If that is not intended,
+	// use [Config.VerifyConnection] instead, or set [Config.SessionTicketsDisabled].
 	//
 	// verifiedChains and its contents should not be modified.
 	VerifyPeerCertificate func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error
@@ -782,6 +805,11 @@ type Config struct {
 	// From Go 1.24, the default includes the [X25519MLKEM768] hybrid
 	// post-quantum key exchange. To disable it, set CurvePreferences explicitly
 	// or use the GODEBUG=tlsmlkem=0 environment variable.
+	//
+	// From Go 1.26, the default includes the [SecP256r1MLKEM768] and
+	// [SecP384r1MLKEM1024] hybrid post-quantum key exchanges, too. To disable
+	// them, set CurvePreferences explicitly or use either the
+	// GODEBUG=tlsmlkem=0 or the GODEBUG=tlssecpmlkem=0 environment variable.
 	CurvePreferences []CurveID
 
 	// DynamicRecordSizingDisabled disables adaptive sizing of TLS records.
@@ -797,7 +825,7 @@ type Config struct {
 	// KeyLogWriter optionally specifies a destination for TLS master secrets
 	// in NSS key log format that can be used to allow external programs
 	// such as Wireshark to decrypt TLS connections.
-	// See https://developer.mozilla.org/en-US/docs/Mozilla/Projects/NSS/Key_Log_Format.
+	// See https://datatracker.ietf.org/doc/draft-ietf-tls-keylogfile/.
 	// Use of KeyLogWriter compromises security and should only be
 	// used for debugging.
 	KeyLogWriter io.Writer
@@ -889,13 +917,29 @@ type Config struct {
 // with a specific ECH config known to a client.
 type EncryptedClientHelloKey struct {
 	// Config should be a marshalled ECHConfig associated with PrivateKey. This
-	// must match the config provided to clients byte-for-byte. The config
-	// should only specify the DHKEM(X25519, HKDF-SHA256) KEM ID (0x0020), the
-	// HKDF-SHA256 KDF ID (0x0001), and a subset of the following AEAD IDs:
-	// AES-128-GCM (0x0001), AES-256-GCM (0x0002), ChaCha20Poly1305 (0x0003).
+	// must match the config provided to clients byte-for-byte. The config must
+	// use as KEM one of
+	//
+	//   - DHKEM(P-256, HKDF-SHA256) (0x0010)
+	//   - DHKEM(P-384, HKDF-SHA384) (0x0011)
+	//   - DHKEM(P-521, HKDF-SHA512) (0x0012)
+	//   - DHKEM(X25519, HKDF-SHA256) (0x0020)
+	//
+	// and as KDF one of
+	//
+	//   - HKDF-SHA256 (0x0001)
+	//   - HKDF-SHA384 (0x0002)
+	//   - HKDF-SHA512 (0x0003)
+	//
+	// and as AEAD one of
+	//
+	//   - AES-128-GCM (0x0001)
+	//   - AES-256-GCM (0x0002)
+	//   - ChaCha20Poly1305 (0x0003)
+	//
 	Config []byte
-	// PrivateKey should be a marshalled private key. Currently, we expect
-	// this to be the output of [ecdh.PrivateKey.Bytes].
+	// PrivateKey should be a marshalled private key, in the format expected by
+	// HPKE's DeserializePrivateKey (see RFC 9180), for the KEM used in Config.
 	PrivateKey []byte
 	// SendAsRetry indicates if Config should be sent as part of the list of
 	// retry configs when ECH is requested by the client but rejected by the
@@ -940,8 +984,15 @@ func (c *Config) ticketKeyFromBytes(b [32]byte) (key ticketKey) {
 // ticket, and the lifetime we set for all tickets we send.
 const maxSessionTicketLifetime = 7 * 24 * time.Hour
 
-// Clone returns a shallow clone of c or nil if c is nil. It is safe to clone a [Config] that is
-// being used concurrently by a TLS client or server.
+// Clone returns a shallow clone of c or nil if c is nil. It is safe to clone a
+// [Config] that is being used concurrently by a TLS client or server.
+//
+// The returned Config can share session ticket keys with the original Config,
+// which means connections could be resumed across the two Configs. WARNING:
+// [Config.VerifyPeerCertificate] does not get called on resumed connections,
+// including connections that were originally established on the parent Config.
+// If that is not intended, use [Config.VerifyConnection] instead, or set
+// [Config.SessionTicketsDisabled].
 func (c *Config) Clone() *Config {
 	if c == nil {
 		return nil
@@ -1559,9 +1610,14 @@ var writerMutex sync.Mutex
 type Certificate struct {
 	Certificate [][]byte
 	// PrivateKey contains the private key corresponding to the public key in
-	// Leaf. This must implement crypto.Signer with an RSA, ECDSA or Ed25519 PublicKey.
+	// Leaf. This must implement [crypto.Signer] with an RSA, ECDSA or Ed25519
+	// PublicKey.
+	//
 	// For a server up to TLS 1.2, it can also implement crypto.Decrypter with
 	// an RSA PublicKey.
+	//
+	// If it implements [crypto.MessageSigner], SignMessage will be used instead
+	// of Sign for TLS 1.2 and later.
 	PrivateKey crypto.PrivateKey
 	// SupportedSignatureAlgorithms is an optional list restricting what
 	// signature algorithms the PrivateKey can be used for.
@@ -1802,4 +1858,44 @@ func fipsAllowChain(chain []*x509.Certificate) bool {
 	}
 
 	return true
+}
+
+// anyValidVerifiedChain reports if at least one of the chains in verifiedChains
+// is valid, as indicated by none of the certificates being expired and the root
+// being in opts.Roots (or in the system root pool if opts.Roots is nil). If
+// verifiedChains is empty, it returns false.
+func anyValidVerifiedChain(verifiedChains [][]*x509.Certificate, opts x509.VerifyOptions) bool {
+	for _, chain := range verifiedChains {
+		if len(chain) == 0 {
+			continue
+		}
+		if slices.ContainsFunc(chain, func(cert *x509.Certificate) bool {
+			return opts.CurrentTime.Before(cert.NotBefore) || opts.CurrentTime.After(cert.NotAfter)
+		}) {
+			continue
+		}
+		// Since we already validated the chain, we only care that it is rooted
+		// in a CA in opts.Roots. On platforms where we control chain validation
+		// (e.g. not Windows or macOS) this is a simple lookup in the CertPool
+		// internal hash map, which we can simulate by running Verify on the
+		// root. On other platforms, we have to do full verification again,
+		// because EKU handling might differ. We will want to replace this with
+		// CertPool.Contains if/once that is available. See go.dev/issue/77376.
+		if runtime.GOOS == "windows" || runtime.GOOS == "darwin" || runtime.GOOS == "ios" {
+			opts.Intermediates = x509.NewCertPool()
+			for _, cert := range chain[1:max(1, len(chain)-1)] {
+				opts.Intermediates.AddCert(cert)
+			}
+			leaf := chain[0]
+			if _, err := leaf.Verify(opts); err == nil {
+				return true
+			}
+		} else {
+			root := chain[len(chain)-1]
+			if _, err := root.Verify(opts); err == nil {
+				return true
+			}
+		}
+	}
+	return false
 }

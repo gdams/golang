@@ -140,6 +140,10 @@ start:
 
 	// 2.7: Memory Ordering Instructions
 	FENCE						// 0f00f00f
+	FENCE	W, W					// 0f001001
+	FENCE	I, O					// 0f004008
+	FENCE	IORW, IORW				// 0f00f00f
+	FENCE.TSO					// 0f003083
 
 	// 4.2: Integer Computational Instructions (RV64I)
 	ADDIW	$1, X5, X6				// 1b831200
@@ -194,6 +198,9 @@ start:
 	RDCYCLE		X5				// f32200c0
 	RDTIME		X5				// f32210c0
 	RDINSTRET	X5				// f32220c0
+
+	// 10.1: Zihintpause Extension for Pause Hint
+	PAUSE						// 0f000001
 
 	// 12.3: Integer Conditional Operations (Zicond)
 	CZEROEQZ	X5, X6, X7			// b353530e
@@ -372,6 +379,76 @@ start:
 	// 21.7: Double-Precision Floating-Point Classify Instruction
 	FCLASSD	F0, X5					// d31200e2
 
+	//
+	// "C" Extension for Compressed Instructions, Version 2.0
+	//
+
+	// 26.3.1: Compressed Stack-Pointer-Based Loads and Stores
+	CLWSP	20(SP), X10				// 5245
+	CLDSP	24(SP), X10				// 6265
+	CFLDSP	32(SP), F10				// 0235
+	CSWSP	X10, 20(SP)				// 2aca
+	CSDSP	X10, 24(SP)				// 2aec
+	CFSDSP	F10, 32(SP)				// 2ab0
+
+	// 26.3.2: Compressed Register-Based Loads and Stores
+	CLW	20(X10), X11				// 4c49
+	CLD	24(X10), X11				// 0c6d
+	CFLD	32(X10), F11				// 0c31
+	CSW	X11, 20(X10)				// 4cc9
+	CSD	X11, 24(X10)				// 0ced
+	CFSD	F11, 32(X10)				// 0cb1
+
+	// 26.4: Compressed Control Transfer Instructions
+	CJ	1(PC)					// 09a0
+	CJR	X5					// 8282
+	CJALR	X5					// 8292
+	CBEQZ	X10, 1(PC)				// 09c1
+	CBNEZ	X10, 1(PC)				// 09e1
+
+	// 26.5.1: Compressed Integer Constant-Generation Instructions
+	CLI	$-32, X5				// 8152
+	CLI	$31, X5					// fd42
+	CLUI	$-32, X5				// 8172
+	CLUI	$31, X5					// fd62
+
+	// 26.5.2: Compressed Integer Register-Immediate Operations
+	CADD	$-32, X5				// 8112
+	CADD	$31, X5					// fd02
+	CADDI	$-32, X5				// 8112
+	CADDI	$31, X5					// fd02
+	CADDW	$-32, X5				// 8132
+	CADDW	$31, X5					// fd22
+	CADDIW	$-32, X5				// 8132
+	CADDIW	$31, X5					// fd22
+	CADDI16SP $-512, SP				// 0171
+	CADDI16SP $496, SP				// 7d61
+	CADDI4SPN $4, SP, X10				// 4800
+	CADDI4SPN $1020, SP, X10			// e81f
+	CSLLI	$63, X5					// fe12
+	CSRLI	$63, X10				// 7d91
+	CSRAI	$63, X10				// 7d95
+	CAND	$-32, X10				// 0199
+	CAND	$31, X10				// 7d89
+	CANDI	$-32, X10				// 0199
+	CANDI	$31, X10				// 7d89
+
+	// 26.5.3: Compressed Integer Register-Register Operations
+	CMV	X6, X5					// 9a82
+	CADD	X9, X8					// 2694
+	CAND	X9, X8					// 658c
+	COR	X9, X8					// 458c
+	CXOR	X9, X8					// 258c
+	CSUB	X9, X8					// 058c
+	CADDW	X9, X8					// 259c
+	CSUBW	X9, X8					// 059c
+
+	// 26.5.5: Compressed NOP Instruction
+	CNOP						// 0100
+
+	// 26.5.6: Compressed Breakpoint Instruction
+	CEBREAK						// 0290
+
 	// 28.4.1: Address Generation Instructions (Zba)
 	ADDUW		X10, X11, X12			// 3b86a508
 	ADDUW		X10, X11			// bb85a508
@@ -438,6 +515,14 @@ start:
 	RORW	$31, X13				// 9bd6f661 or 9bdff6019b961600b3e6df00
 	ORCB	X5, X6					// 13d37228
 	REV8	X7, X8					// 13d4836b
+
+	// 28.4.3: Carry-less multiplication (Zbc)
+	CLMUL	X5, X6, X7 				// b313530a
+	CLMUL	X5, X6	 				// 3313530a
+	CLMULH	X5, X6, X7 				// b333530a
+	CLMULH	X5, X6					// 3333530a
+	CLMULR	X5, X6, X7 				// b323530a
+	CLMULR	X5, X6	 				// 3323530a
 
 	// 28.4.4: Single-bit Instructions (Zbs)
 	BCLR	X23, X24, X25				// b31c7c49
@@ -1923,9 +2008,12 @@ start:
 
 	// Converted to load and shift(s)
 	MOV	$0xffffffff, X5		// MOV	$4294967295, X5			// 9302f0ff93d20202
+	MOV	$0x80000001, X5		// MOV	$2147483649, X5			// b70200809b8212009392020293d20202 or b70200809b821200bb820208
 	MOV	$0x100000000, X5	// MOV	$4294967296, X5			// 9302100093920202
 	MOV	$0xfffffffffffda, X5	// MOV	$4503599627370458, X5		// 9302d0fe9392d20093d2c200
 	MOV	$0xffffffffffffe, X5	// MOV	$4503599627370494, X5		// 9302f0ff9392d20093d2c200
+	MOV	$0x0800000010000000, X5	// MOV	$576460752571858944, X5		// b70200809b8212009392020293d24200
+	MOV	$0x0abcdabcd0000000, X5	// MOV	$773733740479250432, X5		// b7b2cdab9b82d2bc9392020293d24200
 	MOV	$0x7fffffff00000000, X5	// MOV	$9223372032559808512, X5	// b70200809b82f2ff93920202
 	MOV	$0x8000000100000000, X5	// MOV	$-9223372032559808512, X5	// b70200809b82120093920202
 	MOV	$0xffffffff00000000, X5	// MOV	$-4294967296, X5		// 9302f0ff93920202
@@ -1933,11 +2021,8 @@ start:
 	MOV	$0x7fffffffffffffff, X5 // MOV	$9223372036854775807, X5	// 9302f0ff93d21200
 
 	// Converted to load of symbol (AUIPC + LD)
-	MOV	$0x80000001, X5		// MOV	$2147483649, X5			// 9702000083b20200
 	MOV	$0x100000001, X5	// MOV	$4294967297, X5			// 9702000083b20200
-	MOV	$0x0800000010000000, X5	// MOV	$576460752571858944, X5		// 9702000083b20200
 	MOV	$0x8000000010000000, X5	// MOV	$-9223372036586340352, X5	// 9702000083b20200
-	MOV	$0x0abcdabcd0000000, X5	// MOV	$773733740479250432, X5		// 9702000083b20200
 	MOV	$0x8abcdabcd0000000, X5	// MOV	$-8449638296375525376, X5	// 9702000083b20200
 	MOV	$0xfff0000000ffffff, X5 // MOV	$-4503599610593281, X5		// 9702000083b20200
 

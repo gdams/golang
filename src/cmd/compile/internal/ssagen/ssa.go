@@ -12,6 +12,7 @@ import (
 	"go/constant"
 	"html"
 	"internal/buildcfg"
+	"internal/goexperiment"
 	"internal/runtime/gc"
 	"os"
 	"path/filepath"
@@ -124,6 +125,13 @@ func InitConfig() {
 	ir.Syms.GCWriteBarrier[7] = typecheck.LookupRuntimeFunc("gcWriteBarrier8")
 	ir.Syms.Goschedguarded = typecheck.LookupRuntimeFunc("goschedguarded")
 	ir.Syms.Growslice = typecheck.LookupRuntimeFunc("growslice")
+	ir.Syms.GrowsliceBuf = typecheck.LookupRuntimeFunc("growsliceBuf")
+	ir.Syms.GrowsliceBufNoAlias = typecheck.LookupRuntimeFunc("growsliceBufNoAlias")
+	ir.Syms.GrowsliceNoAlias = typecheck.LookupRuntimeFunc("growsliceNoAlias")
+	ir.Syms.MoveSlice = typecheck.LookupRuntimeFunc("moveSlice")
+	ir.Syms.MoveSliceNoScan = typecheck.LookupRuntimeFunc("moveSliceNoScan")
+	ir.Syms.MoveSliceNoCap = typecheck.LookupRuntimeFunc("moveSliceNoCap")
+	ir.Syms.MoveSliceNoCapNoScan = typecheck.LookupRuntimeFunc("moveSliceNoCapNoScan")
 	ir.Syms.InterfaceSwitch = typecheck.LookupRuntimeFunc("interfaceSwitch")
 	for i := 1; i < len(ir.Syms.MallocGCSmallNoScan); i++ {
 		ir.Syms.MallocGCSmallNoScan[i] = typecheck.LookupRuntimeFunc(fmt.Sprintf("mallocgcSmallNoScanSC%d", i))
@@ -132,10 +140,11 @@ func InitConfig() {
 		ir.Syms.MallocGCSmallScanNoHeader[i] = typecheck.LookupRuntimeFunc(fmt.Sprintf("mallocgcSmallScanNoHeaderSC%d", i))
 	}
 	for i := 1; i < len(ir.Syms.MallocGCTiny); i++ {
-		ir.Syms.MallocGCTiny[i] = typecheck.LookupRuntimeFunc(fmt.Sprintf("mallocTiny%d", i))
+		ir.Syms.MallocGCTiny[i] = typecheck.LookupRuntimeFunc(fmt.Sprintf("mallocgcTinySize%d", i))
 	}
 	ir.Syms.MallocGC = typecheck.LookupRuntimeFunc("mallocgc")
 	ir.Syms.Memmove = typecheck.LookupRuntimeFunc("memmove")
+	ir.Syms.Memequal = typecheck.LookupRuntimeFunc("memequal")
 	ir.Syms.Msanread = typecheck.LookupRuntimeFunc("msanread")
 	ir.Syms.Msanwrite = typecheck.LookupRuntimeFunc("msanwrite")
 	ir.Syms.Msanmove = typecheck.LookupRuntimeFunc("msanmove")
@@ -151,6 +160,7 @@ func InitConfig() {
 	ir.Syms.Panicnildottype = typecheck.LookupRuntimeFunc("panicnildottype")
 	ir.Syms.Panicoverflow = typecheck.LookupRuntimeFunc("panicoverflow")
 	ir.Syms.Panicshift = typecheck.LookupRuntimeFunc("panicshift")
+	ir.Syms.PanicSimdImm = typecheck.LookupRuntimeFunc("panicSimdImm")
 	ir.Syms.Racefuncenter = typecheck.LookupRuntimeFunc("racefuncenter")
 	ir.Syms.Racefuncexit = typecheck.LookupRuntimeFunc("racefuncexit")
 	ir.Syms.Raceread = typecheck.LookupRuntimeFunc("raceread")
@@ -160,9 +170,10 @@ func InitConfig() {
 	ir.Syms.TypeAssert = typecheck.LookupRuntimeFunc("typeAssert")
 	ir.Syms.WBZero = typecheck.LookupRuntimeFunc("wbZero")
 	ir.Syms.WBMove = typecheck.LookupRuntimeFunc("wbMove")
+	ir.Syms.X86HasAVX = typecheck.LookupRuntimeVar("x86HasAVX")               // bool
+	ir.Syms.X86HasFMA = typecheck.LookupRuntimeVar("x86HasFMA")               // bool
 	ir.Syms.X86HasPOPCNT = typecheck.LookupRuntimeVar("x86HasPOPCNT")         // bool
 	ir.Syms.X86HasSSE41 = typecheck.LookupRuntimeVar("x86HasSSE41")           // bool
-	ir.Syms.X86HasFMA = typecheck.LookupRuntimeVar("x86HasFMA")               // bool
 	ir.Syms.ARMHasVFPv4 = typecheck.LookupRuntimeVar("armHasVFPv4")           // bool
 	ir.Syms.ARM64HasATOMICS = typecheck.LookupRuntimeVar("arm64HasATOMICS")   // bool
 	ir.Syms.Loong64HasLAMCAS = typecheck.LookupRuntimeVar("loong64HasLAMCAS") // bool
@@ -272,6 +283,7 @@ func (s *state) emitOpenDeferInfo() {
 
 	x := base.Ctxt.Lookup(s.curfn.LSym.Name + ".opendefer")
 	x.Set(obj.AttrContentAddressable, true)
+	x.Align = 1
 	s.curfn.LSym.Func().OpenCodedDeferInfo = x
 
 	off := 0
@@ -329,9 +341,9 @@ func buildssa(fn *ir.Func, worker int, isPgoHot bool) *ssa.Func {
 	if base.Flag.Cfg.Instrumenting && fn.Pragma&ir.Norace == 0 && !fn.Linksym().ABIWrapper() {
 		if !base.Flag.Race || !objabi.LookupPkgSpecial(fn.Sym().Pkg.Path).NoRaceFunc {
 			s.instrumentMemory = true
-		}
-		if base.Flag.Race {
-			s.instrumentEnterExit = true
+			if base.Flag.Race {
+				s.instrumentEnterExit = true
+			}
 		}
 	}
 
@@ -595,6 +607,9 @@ func buildssa(fn *ir.Func, worker int, isPgoHot bool) *ssa.Func {
 	// TODO figure out exactly what's unused, don't spill it. Make liveness fine-grained, also.
 	for _, p := range params.InParams() {
 		typs, offs := p.RegisterTypesAndOffsets()
+		if len(offs) < len(typs) {
+			s.Fatalf("len(offs)=%d < len(typs)=%d, params=\n%s", len(offs), len(typs), params)
+		}
 		for i, t := range typs {
 			o := offs[i]                // offset within parameter
 			fo := p.FrameOffset(params) // offset of parameter in frame
@@ -1091,6 +1106,23 @@ type state struct {
 
 	// Block starting position, indexed by block id.
 	blockStarts []src.XPos
+
+	// Information for stack allocation. Indexed by the first argument
+	// to an append call. Normally a slice-typed variable, but not always.
+	backingStores map[ir.Node]*backingStoreInfo
+}
+
+type backingStoreInfo struct {
+	// Size of backing store array (in elements)
+	K int64
+	// Stack-allocated backing store variable.
+	store *ir.Name
+	// Dynamic boolean variable marking the fact that we used this backing store.
+	used *ir.Name
+	// Have we used this variable statically yet? This is just a hint
+	// to avoid checking the dynamic variable if the answer is obvious.
+	// (usedStatic == true implies used == true)
+	usedStatic bool
 }
 
 type funcLine struct {
@@ -1115,13 +1147,13 @@ func (s *state) label(sym *types.Sym) *ssaLabel {
 	return lab
 }
 
-func (s *state) Logf(msg string, args ...interface{}) { s.f.Logf(msg, args...) }
-func (s *state) Log() bool                            { return s.f.Log() }
-func (s *state) Fatalf(msg string, args ...interface{}) {
+func (s *state) Logf(msg string, args ...any) { s.f.Logf(msg, args...) }
+func (s *state) Log() bool                    { return s.f.Log() }
+func (s *state) Fatalf(msg string, args ...any) {
 	s.f.Frontend().Fatalf(s.peekPos(), msg, args...)
 }
-func (s *state) Warnl(pos src.XPos, msg string, args ...interface{}) { s.f.Warnl(pos, msg, args...) }
-func (s *state) Debug_checknil() bool                                { return s.f.Frontend().Debug_checknil() }
+func (s *state) Warnl(pos src.XPos, msg string, args ...any) { s.f.Warnl(pos, msg, args...) }
+func (s *state) Debug_checknil() bool                        { return s.f.Frontend().Debug_checknil() }
 
 func ssaMarker(name string) *ir.Name {
 	return ir.NewNameAt(base.Pos, &types.Sym{Name: name}, nil)
@@ -1311,6 +1343,11 @@ func (s *state) newValue4(op ssa.Op, t *types.Type, arg0, arg1, arg2, arg3 *ssa.
 	return s.curBlock.NewValue4(s.peekPos(), op, t, arg0, arg1, arg2, arg3)
 }
 
+// newValue4A adds a new value with four arguments and an aux value to the current block.
+func (s *state) newValue4A(op ssa.Op, t *types.Type, aux ssa.Aux, arg0, arg1, arg2, arg3 *ssa.Value) *ssa.Value {
+	return s.curBlock.NewValue4A(s.peekPos(), op, t, aux, arg0, arg1, arg2, arg3)
+}
+
 // newValue4I adds a new value with four arguments and an auxint value to the current block.
 func (s *state) newValue4I(op ssa.Op, t *types.Type, aux int64, arg0, arg1, arg2, arg3 *ssa.Value) *ssa.Value {
 	return s.curBlock.NewValue4I(s.peekPos(), op, t, aux, arg0, arg1, arg2, arg3)
@@ -1440,7 +1477,7 @@ func (s *state) instrument(t *types.Type, addr *ssa.Value, kind instrumentKind) 
 // If it is instrumenting for MSAN or ASAN and t is a struct type, it instruments
 // operation for each field, instead of for the whole struct.
 func (s *state) instrumentFields(t *types.Type, addr *ssa.Value, kind instrumentKind) {
-	if !(base.Flag.MSan || base.Flag.ASan) || !t.IsStruct() {
+	if !(base.Flag.MSan || base.Flag.ASan) || !isStructNotSIMD(t) {
 		s.instrument(t, addr, kind)
 		return
 	}
@@ -3518,9 +3555,9 @@ func (s *state) exprCheckPtr(n ir.Node, checkPtrOK bool) *ssa.Value {
 					// use constants for the bounds check.
 					z := s.constInt(types.Types[types.TINT], 0)
 					s.boundsCheck(z, z, ssa.BoundsIndex, false)
-					// The return value won't be live, return junk.
-					// But not quite junk, in case bounds checks are turned off. See issue 48092.
-					return s.zeroVal(n.Type())
+					// The return value won't be live. In case bounds checks
+					// are turned off, load from (*T)(nil) to cause a segfault.
+					return s.load(n.Type(), s.constNil(n.Type().PtrTo()))
 				}
 				len := s.constInt(types.Types[types.TINT], bound)
 				s.boundsCheck(i, len, ssa.BoundsIndex, n.Bounded()) // checks i == 0
@@ -3673,6 +3710,9 @@ func (s *state) exprCheckPtr(n ir.Node, checkPtrOK bool) *ssa.Value {
 	case ir.OAPPEND:
 		return s.append(n.(*ir.CallExpr), false)
 
+	case ir.OMOVE2HEAP:
+		return s.move2heap(n.(*ir.MoveToHeapExpr))
+
 	case ir.OMIN, ir.OMAX:
 		return s.minMax(n.(*ir.CallExpr))
 
@@ -3732,6 +3772,68 @@ func (s *state) resultAddrOfCall(c *ssa.Value, which int64, t *types.Type) *ssa.
 	rval := s.newValue1I(ssa.OpSelectN, t, which, c)
 	s.vars[memVar] = s.newValue3Apos(ssa.OpStore, types.TypeMem, t, addr, rval, s.mem(), false)
 	return addr
+}
+
+// Get backing store information for an append call.
+func (s *state) getBackingStoreInfoForAppend(n *ir.CallExpr) *backingStoreInfo {
+	if n.Esc() != ir.EscNone {
+		return nil
+	}
+	return s.getBackingStoreInfo(n.Args[0])
+}
+func (s *state) getBackingStoreInfo(n ir.Node) *backingStoreInfo {
+	t := n.Type()
+	et := t.Elem()
+	maxStackSize := int64(base.Debug.VariableMakeThreshold)
+	if et.Size() == 0 || et.Size() > maxStackSize {
+		return nil
+	}
+	if base.Flag.N != 0 {
+		return nil
+	}
+	if !base.VariableMakeHash.MatchPos(n.Pos(), nil) {
+		return nil
+	}
+	i := s.backingStores[n]
+	if i != nil {
+		return i
+	}
+
+	// Build type of backing store.
+	K := maxStackSize / et.Size() // rounds down
+	KT := types.NewArray(et, K)
+	KT.SetNoalg(true)
+	types.CalcArraySize(KT)
+	// Align more than naturally for the type KT. See issue 73199.
+	align := types.NewArray(types.Types[types.TUINTPTR], 0)
+	types.CalcArraySize(align)
+	storeTyp := types.NewStruct([]*types.Field{
+		{Sym: types.BlankSym, Type: align},
+		{Sym: types.BlankSym, Type: KT},
+	})
+	storeTyp.SetNoalg(true)
+	types.CalcStructSize(storeTyp)
+
+	// Make backing store variable.
+	backingStore := typecheck.TempAt(n.Pos(), s.curfn, storeTyp)
+	backingStore.SetAddrtaken(true)
+
+	// Make "used" boolean.
+	used := typecheck.TempAt(n.Pos(), s.curfn, types.Types[types.TBOOL])
+	if s.curBlock == s.f.Entry {
+		s.vars[used] = s.constBool(false)
+	} else {
+		// initialize this variable at end of entry block
+		s.defvars[s.f.Entry.ID][used] = s.constBool(false)
+	}
+
+	// Initialize an info structure.
+	if s.backingStores == nil {
+		s.backingStores = map[ir.Node]*backingStoreInfo{}
+	}
+	i = &backingStoreInfo{K: K, store: backingStore, used: used, usedStatic: false}
+	s.backingStores[n] = i
+	return i
 }
 
 // append converts an OAPPEND node to SSA.
@@ -3824,9 +3926,29 @@ func (s *state) append(n *ir.CallExpr, inplace bool) *ssa.Value {
 	// A stack-allocated backing store could be used at every
 	// append that qualifies, but we limit it in some cases to
 	// avoid wasted code and stack space.
-	// TODO: handle ... append case.
-	maxStackSize := int64(base.Debug.VariableMakeThreshold)
-	if !inplace && n.Esc() == ir.EscNone && et.Size() > 0 && et.Size() <= maxStackSize && base.Flag.N == 0 && base.VariableMakeHash.MatchPos(n.Pos(), nil) && !s.appendTargets[sn] {
+	//
+	// Note that we have two different strategies.
+	// 1. The standard strategy is just to allocate the full
+	//    backing store at the first append.
+	// 2. An alternate strategy is used when
+	//        a. The backing store eventually escapes via move2heap
+	//    and b. The capacity is used somehow
+	//    In this case, we don't want to just allocate
+	//    the full buffer at the first append, because when
+	//    we move2heap the buffer to the heap when it escapes,
+	//    we might end up wasting memory because we can't
+	//    change the capacity.
+	//    So in this case we use growsliceBuf to reuse the buffer
+	//    and walk one step up the size class ladder each time.
+	//
+	// TODO: handle ... append case? Currently we handle only
+	// a fixed number of appended elements.
+	var info *backingStoreInfo
+	if !inplace {
+		info = s.getBackingStoreInfoForAppend(n)
+	}
+
+	if !inplace && info != nil && !n.UseBuf && !info.usedStatic {
 		// if l <= K {
 		//   if !used {
 		//     if oldLen == 0 {
@@ -3850,43 +3972,19 @@ func (s *state) append(n *ir.CallExpr, inplace bool) *ssa.Value {
 		// It is ok to do it more often, but it is probably helpful only for
 		// the first instance. TODO: this could use more tuning. Using ir.Node
 		// as the key works for *ir.Name instances but probably nothing else.
-		if s.appendTargets == nil {
-			s.appendTargets = map[ir.Node]bool{}
-		}
-		s.appendTargets[sn] = true
-
-		K := maxStackSize / et.Size() // rounds down
-		KT := types.NewArray(et, K)
-		KT.SetNoalg(true)
-		types.CalcArraySize(KT)
-		// Align more than naturally for the type KT. See issue 73199.
-		align := types.NewArray(types.Types[types.TUINTPTR], 0)
-		types.CalcArraySize(align)
-		storeTyp := types.NewStruct([]*types.Field{
-			{Sym: types.BlankSym, Type: align},
-			{Sym: types.BlankSym, Type: KT},
-		})
-		storeTyp.SetNoalg(true)
-		types.CalcStructSize(storeTyp)
+		info.usedStatic = true
+		// TODO: unset usedStatic somehow?
 
 		usedTestBlock := s.f.NewBlock(ssa.BlockPlain)
 		oldLenTestBlock := s.f.NewBlock(ssa.BlockPlain)
 		bodyBlock := s.f.NewBlock(ssa.BlockPlain)
 		growSlice := s.f.NewBlock(ssa.BlockPlain)
-
-		// Make "used" boolean.
-		tBool := types.Types[types.TBOOL]
-		used := typecheck.TempAt(n.Pos(), s.curfn, tBool)
-		s.defvars[s.f.Entry.ID][used] = s.constBool(false) // initialize this variable at fn entry
-
-		// Make backing store variable.
 		tInt := types.Types[types.TINT]
-		backingStore := typecheck.TempAt(n.Pos(), s.curfn, storeTyp)
-		backingStore.SetAddrtaken(true)
+		tBool := types.Types[types.TBOOL]
 
 		// if l <= K
 		s.startBlock(grow)
-		kTest := s.newValue2(s.ssaOp(ir.OLE, tInt), tBool, l, s.constInt(tInt, K))
+		kTest := s.newValue2(s.ssaOp(ir.OLE, tInt), tBool, l, s.constInt(tInt, info.K))
 		b := s.endBlock()
 		b.Kind = ssa.BlockIf
 		b.SetControl(kTest)
@@ -3896,7 +3994,7 @@ func (s *state) append(n *ir.CallExpr, inplace bool) *ssa.Value {
 
 		// if !used
 		s.startBlock(usedTestBlock)
-		usedTest := s.newValue1(ssa.OpNot, tBool, s.expr(used))
+		usedTest := s.newValue1(ssa.OpNot, tBool, s.expr(info.used))
 		b = s.endBlock()
 		b.Kind = ssa.BlockIf
 		b.SetControl(usedTest)
@@ -3917,18 +4015,18 @@ func (s *state) append(n *ir.CallExpr, inplace bool) *ssa.Value {
 		// var store struct { _ [0]uintptr; arr [K]T }
 		s.startBlock(bodyBlock)
 		if et.HasPointers() {
-			s.vars[memVar] = s.newValue1A(ssa.OpVarDef, types.TypeMem, backingStore, s.mem())
+			s.vars[memVar] = s.newValue1A(ssa.OpVarDef, types.TypeMem, info.store, s.mem())
 		}
-		addr := s.addr(backingStore)
-		s.zero(storeTyp, addr)
+		addr := s.addr(info.store)
+		s.zero(info.store.Type(), addr)
 
 		// s = store.arr[:l:K]
 		s.vars[ptrVar] = addr
 		s.vars[lenVar] = l // nargs would also be ok because of the oldLen==0 test.
-		s.vars[capVar] = s.constInt(tInt, K)
+		s.vars[capVar] = s.constInt(tInt, info.K)
 
 		// used = true
-		s.assign(used, s.constBool(true), false, 0)
+		s.assign(info.used, s.constBool(true), false, 0)
 		b = s.endBlock()
 		b.AddEdgeTo(assign)
 
@@ -3939,7 +4037,41 @@ func (s *state) append(n *ir.CallExpr, inplace bool) *ssa.Value {
 	// Call growslice
 	s.startBlock(grow)
 	taddr := s.expr(n.Fun)
-	r := s.rtcall(ir.Syms.Growslice, true, []*types.Type{n.Type()}, p, l, c, nargs, taddr)
+	var r []*ssa.Value
+	if info != nil && n.UseBuf {
+		// Use stack-allocated buffer as backing store, if we can.
+		if et.HasPointers() && !info.usedStatic {
+			// Initialize in the function header. Not the best place,
+			// but it makes sure we don't scan this area before it is
+			// initialized.
+			mem := s.defvars[s.f.Entry.ID][memVar]
+			mem = s.f.Entry.NewValue1A(n.Pos(), ssa.OpVarDef, types.TypeMem, info.store, mem)
+			addr := s.f.Entry.NewValue2A(n.Pos(), ssa.OpLocalAddr, types.NewPtr(info.store.Type()), info.store, s.sp, mem)
+			mem = s.f.Entry.NewValue2I(n.Pos(), ssa.OpZero, types.TypeMem, info.store.Type().Size(), addr, mem)
+			mem.Aux = info.store.Type()
+			s.defvars[s.f.Entry.ID][memVar] = mem
+			info.usedStatic = true
+		}
+		fn := ir.Syms.GrowsliceBuf
+		if goexperiment.RuntimeFreegc && n.AppendNoAlias && !et.HasPointers() {
+			// The append is for a non-aliased slice where the runtime knows how to free
+			// the old logically dead backing store after growth.
+			// TODO(thepudds): for now, we only use the NoAlias version for element types
+			// without pointers while waiting on additional runtime support (CL 698515).
+			fn = ir.Syms.GrowsliceBufNoAlias
+		}
+		r = s.rtcall(fn, true, []*types.Type{n.Type()}, p, l, c, nargs, taddr, s.addr(info.store), s.constInt(types.Types[types.TINT], info.K))
+	} else {
+		fn := ir.Syms.Growslice
+		if goexperiment.RuntimeFreegc && n.AppendNoAlias && !et.HasPointers() {
+			// The append is for a non-aliased slice where the runtime knows how to free
+			// the old logically dead backing store after growth.
+			// TODO(thepudds): for now, we only use the NoAlias version for element types
+			// without pointers while waiting on additional runtime support (CL 698515).
+			fn = ir.Syms.GrowsliceNoAlias
+		}
+		r = s.rtcall(fn, true, []*types.Type{n.Type()}, p, l, c, nargs, taddr)
+	}
 
 	// Decompose output slice
 	p = s.newValue1(ssa.OpSlicePtr, pt, r[0])
@@ -4024,6 +4156,95 @@ func (s *state) append(n *ir.CallExpr, inplace bool) *ssa.Value {
 		return nil
 	}
 	return s.newValue3(ssa.OpSliceMake, n.Type(), p, l, c)
+}
+
+func (s *state) move2heap(n *ir.MoveToHeapExpr) *ssa.Value {
+	// s := n.Slice
+	// if s.ptr points to current stack frame {
+	//     s2 := make([]T, s.len, s.cap)
+	//     copy(s2[:cap], s[:cap])
+	//     s = s2
+	// }
+	// return s
+
+	slice := s.expr(n.Slice)
+	et := slice.Type.Elem()
+	pt := types.NewPtr(et)
+
+	info := s.getBackingStoreInfo(n)
+	if info == nil {
+		// Backing store will never be stack allocated, so
+		// move2heap is a no-op.
+		return slice
+	}
+
+	// Decomposse input slice.
+	p := s.newValue1(ssa.OpSlicePtr, pt, slice)
+	l := s.newValue1(ssa.OpSliceLen, types.Types[types.TINT], slice)
+	c := s.newValue1(ssa.OpSliceCap, types.Types[types.TINT], slice)
+
+	moveBlock := s.f.NewBlock(ssa.BlockPlain)
+	mergeBlock := s.f.NewBlock(ssa.BlockPlain)
+
+	s.vars[ptrVar] = p
+	s.vars[lenVar] = l
+	s.vars[capVar] = c
+
+	// Decide if we need to move the slice backing store.
+	// It needs to be moved if it is currently on the stack.
+	sub := ssa.OpSub64
+	less := ssa.OpLess64U
+	if s.config.PtrSize == 4 {
+		sub = ssa.OpSub32
+		less = ssa.OpLess32U
+	}
+	callerSP := s.newValue1(ssa.OpGetCallerSP, types.Types[types.TUINTPTR], s.mem())
+	frameSize := s.newValue2(sub, types.Types[types.TUINTPTR], callerSP, s.sp)
+	pInt := s.newValue2(ssa.OpConvert, types.Types[types.TUINTPTR], p, s.mem())
+	off := s.newValue2(sub, types.Types[types.TUINTPTR], pInt, s.sp)
+	cond := s.newValue2(less, types.Types[types.TBOOL], off, frameSize)
+
+	b := s.endBlock()
+	b.Kind = ssa.BlockIf
+	b.Likely = ssa.BranchUnlikely // fast path is to not have to call into runtime
+	b.SetControl(cond)
+	b.AddEdgeTo(moveBlock)
+	b.AddEdgeTo(mergeBlock)
+
+	// Move the slice to heap
+	s.startBlock(moveBlock)
+	var newSlice *ssa.Value
+	if et.HasPointers() {
+		typ := s.expr(n.RType)
+		if n.PreserveCapacity {
+			newSlice = s.rtcall(ir.Syms.MoveSlice, true, []*types.Type{slice.Type}, typ, p, l, c)[0]
+		} else {
+			newSlice = s.rtcall(ir.Syms.MoveSliceNoCap, true, []*types.Type{slice.Type}, typ, p, l)[0]
+		}
+	} else {
+		elemSize := s.constInt(types.Types[types.TUINTPTR], et.Size())
+		if n.PreserveCapacity {
+			newSlice = s.rtcall(ir.Syms.MoveSliceNoScan, true, []*types.Type{slice.Type}, elemSize, p, l, c)[0]
+		} else {
+			newSlice = s.rtcall(ir.Syms.MoveSliceNoCapNoScan, true, []*types.Type{slice.Type}, elemSize, p, l)[0]
+		}
+	}
+	// Decompose output slice
+	s.vars[ptrVar] = s.newValue1(ssa.OpSlicePtr, pt, newSlice)
+	s.vars[lenVar] = s.newValue1(ssa.OpSliceLen, types.Types[types.TINT], newSlice)
+	s.vars[capVar] = s.newValue1(ssa.OpSliceCap, types.Types[types.TINT], newSlice)
+	b = s.endBlock()
+	b.AddEdgeTo(mergeBlock)
+
+	// Merge fast path (no moving) and slow path (moved)
+	s.startBlock(mergeBlock)
+	p = s.variable(ptrVar, pt)                      // generates phi for ptr
+	l = s.variable(lenVar, types.Types[types.TINT]) // generates phi for len
+	c = s.variable(capVar, types.Types[types.TINT]) // generates phi for cap
+	delete(s.vars, ptrVar)
+	delete(s.vars, lenVar)
+	delete(s.vars, capVar)
+	return s.newValue3(ssa.OpSliceMake, slice.Type, p, l, c)
 }
 
 // minMax converts an OMIN/OMAX builtin call into SSA.
@@ -4268,6 +4489,11 @@ func (s *state) assignWhichMayOverlap(left ir.Node, right *ssa.Value, deref bool
 			// Grab old value of structure.
 			old := s.expr(left.X)
 
+			if left.Type().Size() == 0 {
+				// Nothing to do when assigning zero-sized things.
+				return
+			}
+
 			// Make new structure.
 			new := s.newValue0(ssa.OpStructMake, t)
 
@@ -4303,8 +4529,20 @@ func (s *state) assignWhichMayOverlap(left ir.Node, right *ssa.Value, deref bool
 				return
 			}
 			if n != 1 {
-				s.Fatalf("assigning to non-1-length array")
+				// This can happen in weird, always-panics cases, like:
+				//     var x [0][2]int
+				//     x[i][j] = 5
+				// We know it always panics because the LHS is ssa-able,
+				// and arrays of length > 1 can't be ssa-able unless
+				// they are somewhere inside an outer [0].
+				// We can ignore the actual assignment, it is dynamically
+				// unreachable. See issue 77635.
+				return
 			}
+			if t.Size() == 0 {
+				return
+			}
+
 			// Rewrite to a = [1]{v}
 			len := s.constInt(types.Types[types.TINT], 1)
 			s.boundsCheck(i, len, ssa.BoundsIndex, false) // checks i == 0
@@ -4350,6 +4588,9 @@ func (s *state) assignWhichMayOverlap(left ir.Node, right *ssa.Value, deref bool
 
 // zeroVal returns the zero value for type t.
 func (s *state) zeroVal(t *types.Type) *ssa.Value {
+	if t.Size() == 0 {
+		return s.entryNewValue0(ssa.OpEmpty, t)
+	}
 	switch {
 	case t.IsInteger():
 		switch t.Size() {
@@ -4395,20 +4636,17 @@ func (s *state) zeroVal(t *types.Type) *ssa.Value {
 		return s.constInterface(t)
 	case t.IsSlice():
 		return s.constSlice(t)
-	case t.IsStruct():
+	case isStructNotSIMD(t):
 		n := t.NumFields()
 		v := s.entryNewValue0(ssa.OpStructMake, t)
 		for i := 0; i < n; i++ {
 			v.AddArg(s.zeroVal(t.FieldType(i)))
 		}
 		return v
-	case t.IsArray():
-		switch t.NumElem() {
-		case 0:
-			return s.entryNewValue0(ssa.OpArrayMake0, t)
-		case 1:
-			return s.entryNewValue1(ssa.OpArrayMake1, t, s.zeroVal(t.Elem()))
-		}
+	case t.IsArray() && t.NumElem() == 1:
+		return s.entryNewValue1(ssa.OpArrayMake1, t, s.zeroVal(t.Elem()))
+	case t.IsSIMD():
+		return s.newValue0(ssa.OpZeroSIMD, t)
 	}
 	s.Fatalf("zero for type %v not implemented", t)
 	return nil
@@ -4776,7 +5014,7 @@ func (s *state) call(n *ir.CallExpr, k callKind, returnResultAddr bool, deferExt
 		fn := fn.(*ir.SelectorExpr)
 		var iclosure *ssa.Value
 		iclosure, rcvr = s.getClosureAndRcvr(fn)
-		if k == callNormal {
+		if k == callNormal || k == callTail {
 			codeptr = s.load(types.Types[types.TUINTPTR], iclosure)
 		} else {
 			closure = iclosure
@@ -4892,6 +5130,10 @@ func (s *state) call(n *ir.CallExpr, k callKind, returnResultAddr bool, deferExt
 			// Note that the "receiver" parameter is nil because the actual receiver is the first input parameter.
 			aux := ssa.InterfaceAuxCall(params)
 			call = s.newValue1A(ssa.OpInterLECall, aux.LateExpansionResultType(), aux, codeptr)
+			if k == callTail {
+				call.Op = ssa.OpTailLECallInter
+				stksize = 0 // Tail call does not use stack. We reuse caller's frame.
+			}
 		case calleeLSym != nil:
 			aux := ssa.StaticAuxCall(calleeLSym, params)
 			call = s.newValue0A(ssa.OpStaticLECall, aux.LateExpansionResultType(), aux)
@@ -4920,6 +5162,19 @@ func (s *state) call(n *ir.CallExpr, k callKind, returnResultAddr bool, deferExt
 		s.vars[memVar] = s.newValue1A(ssa.OpVarLive, types.TypeMem, v, s.mem())
 	}
 
+	// Build result value (before we might end the defer block, below).
+	var result *ssa.Value
+	if len(res) == 0 || k != callNormal {
+		result = nil
+	} else {
+		fp := res[0]
+		if returnResultAddr {
+			result = s.resultAddrOfCall(call, 0, fp.Type)
+		} else {
+			result = s.newValue1I(ssa.OpSelectN, fp.Type, 0, call)
+		}
+	}
+
 	// Finish block for defers
 	if k == callDefer || k == callDeferStack || isCallDeferRangeFunc {
 		b := s.endBlock()
@@ -4939,15 +5194,7 @@ func (s *state) call(n *ir.CallExpr, k callKind, returnResultAddr bool, deferExt
 		s.startBlock(bNext)
 	}
 
-	if len(res) == 0 || k != callNormal {
-		// call has no return value. Continue with the next statement.
-		return nil
-	}
-	fp := res[0]
-	if returnResultAddr {
-		return s.resultAddrOfCall(call, 0, fp.Type)
-	}
-	return s.newValue1I(ssa.OpSelectN, fp.Type, 0, call)
+	return result
 }
 
 // maybeNilCheckClosure checks if a nil check of a closure is needed in some
@@ -4993,7 +5240,15 @@ func (s *state) addr(n ir.Node) *ssa.Value {
 	}
 
 	if s.canSSA(n) {
-		s.Fatalf("addr of canSSA expression: %+v", n)
+		// This happens in weird, always-panics cases, like:
+		//     var x [0][2]int
+		//     x[i][j] = 5
+		// The outer assignment, ...[j] = 5, is a fine
+		// assignment to do, but requires computing the address
+		// &x[i], which will always panic when evaluated.
+		// We just return something reasonable in this case.
+		// It will be dynamically unreachable. See issue 77635.
+		return s.newValue1A(ssa.OpAddr, n.Type().PtrTo(), ir.Syms.Zerobase, s.sb)
 	}
 
 	t := types.NewPtr(n.Type())
@@ -5388,7 +5643,7 @@ func (s *state) storeType(t *types.Type, left, right *ssa.Value, skip skipMask, 
 // do *left = right for all scalar (non-pointer) parts of t.
 func (s *state) storeTypeScalars(t *types.Type, left, right *ssa.Value, skip skipMask) {
 	switch {
-	case t.IsBoolean() || t.IsInteger() || t.IsFloat() || t.IsComplex():
+	case t.IsBoolean() || t.IsInteger() || t.IsFloat() || t.IsComplex() || t.IsSIMD():
 		s.store(t, left, right)
 	case t.IsPtrShaped():
 		if t.IsPtr() && t.Elem().NotInHeap() {
@@ -5417,7 +5672,7 @@ func (s *state) storeTypeScalars(t *types.Type, left, right *ssa.Value, skip ski
 		// itab field doesn't need a write barrier (even though it is a pointer).
 		itab := s.newValue1(ssa.OpITab, s.f.Config.Types.BytePtr, right)
 		s.store(types.Types[types.TUINTPTR], left, itab)
-	case t.IsStruct():
+	case isStructNotSIMD(t):
 		n := t.NumFields()
 		for i := 0; i < n; i++ {
 			ft := t.FieldType(i)
@@ -5425,7 +5680,7 @@ func (s *state) storeTypeScalars(t *types.Type, left, right *ssa.Value, skip ski
 			val := s.newValue1I(ssa.OpStructSelect, ft, int64(i), right)
 			s.storeTypeScalars(ft, addr, val, 0)
 		}
-	case t.IsArray() && t.NumElem() == 0:
+	case t.IsArray() && t.Size() == 0:
 		// nothing
 	case t.IsArray() && t.NumElem() == 1:
 		s.storeTypeScalars(t.Elem(), left, s.newValue1I(ssa.OpArraySelect, t.Elem(), 0, right), 0)
@@ -5454,7 +5709,7 @@ func (s *state) storeTypePtrs(t *types.Type, left, right *ssa.Value) {
 		idata := s.newValue1(ssa.OpIData, s.f.Config.Types.BytePtr, right)
 		idataAddr := s.newValue1I(ssa.OpOffPtr, s.f.Config.Types.BytePtrPtr, s.config.PtrSize, left)
 		s.store(s.f.Config.Types.BytePtr, idataAddr, idata)
-	case t.IsStruct():
+	case isStructNotSIMD(t):
 		n := t.NumFields()
 		for i := 0; i < n; i++ {
 			ft := t.FieldType(i)
@@ -5465,7 +5720,7 @@ func (s *state) storeTypePtrs(t *types.Type, left, right *ssa.Value) {
 			val := s.newValue1I(ssa.OpStructSelect, ft, int64(i), right)
 			s.storeTypePtrs(ft, addr, val)
 		}
-	case t.IsArray() && t.NumElem() == 0:
+	case t.IsArray() && t.Size() == 0:
 		// nothing
 	case t.IsArray() && t.NumElem() == 1:
 		s.storeTypePtrs(t.Elem(), left, s.newValue1I(ssa.OpArraySelect, t.Elem(), 0, right))
@@ -5970,8 +6225,8 @@ func (s *state) dottype(n *ir.TypeAssertExpr, commaok bool) (res, resok *ssa.Val
 			base.Fatalf("unexpected *ir.TypeAssertExpr with UseNilPanic == true && commaok == true")
 		}
 		if n.Type().IsInterface() {
-			// Currently we do not expect the compiler to emit type asserts with UseNilPanic, that assert to an interface type.
-			// If needed, this can be relaxed in the future, but for now we can assert that.
+			// Currently we do not expect the compiler to emit type assertions with UseNilPanic, that asserts to an interface type.
+			// If needed, this can be relaxed in the future, but for now we can't assert that.
 			base.Fatalf("unexpected *ir.TypeAssertExpr with UseNilPanic == true && Type().IsInterface() == true")
 		}
 		typs := s.f.Config.Types
@@ -6559,6 +6814,7 @@ func emitArgInfo(e *ssafn, f *ssa.Func, pp *objw.Progs) {
 // emit argument info (locations on stack) of f for traceback.
 func EmitArgInfo(f *ir.Func, abiInfo *abi.ABIParamResultInfo) *obj.LSym {
 	x := base.Ctxt.Lookup(fmt.Sprintf("%s.arginfo%d", f.LSym.Name, f.ABI))
+	x.Align = 1
 	// NOTE: do not set ContentAddressable here. This may be referenced from
 	// assembly code by name (in this case f is a declaration).
 	// Instead, set it in emitArgInfo above.
@@ -6567,7 +6823,7 @@ func EmitArgInfo(f *ir.Func, abiInfo *abi.ABIParamResultInfo) *obj.LSym {
 	uintptrTyp := types.Types[types.TUINTPTR]
 
 	isAggregate := func(t *types.Type) bool {
-		return t.IsStruct() || t.IsArray() || t.IsComplex() || t.IsInterface() || t.IsString() || t.IsSlice()
+		return isStructNotSIMD(t) || t.IsArray() || t.IsComplex() || t.IsInterface() || t.IsString() || t.IsSlice()
 	}
 
 	wOff := 0
@@ -6627,7 +6883,7 @@ func EmitArgInfo(f *ir.Func, abiInfo *abi.ABIParamResultInfo) *obj.LSym {
 				}
 				baseOffset += t.Elem().Size()
 			}
-		case t.IsStruct():
+		case isStructNotSIMD(t):
 			if t.NumFields() == 0 {
 				n++ // {} counts as a component
 				break
@@ -6678,6 +6934,7 @@ func emitWrappedFuncInfo(e *ssafn, pp *objw.Progs) {
 	x := base.Ctxt.LookupInit(fmt.Sprintf("%s.wrapinfo", wsym.Name), func(x *obj.LSym) {
 		objw.SymPtrOff(x, 0, wsym)
 		x.Set(obj.AttrContentAddressable, true)
+		x.Align = 4
 	})
 	e.curfn.LSym.Func().WrapInfo = x
 
@@ -7573,7 +7830,7 @@ func AddrAuto(a *obj.Addr, v *ssa.Value) {
 // Call returns a new CALL instruction for the SSA value v.
 // It uses PrepareCall to prepare the call.
 func (s *State) Call(v *ssa.Value) *obj.Prog {
-	pPosIsStmt := s.pp.Pos.IsStmt() // The statement-ness fo the call comes from ssaGenState
+	pPosIsStmt := s.pp.Pos.IsStmt() // The statement-ness of the call comes from ssaGenState
 	s.PrepareCall(v)
 
 	p := s.Prog(obj.ACALL)
@@ -7647,7 +7904,7 @@ func (s *State) UseArgs(n int64) {
 // fieldIdx finds the index of the field referred to by the ODOT node n.
 func fieldIdx(n *ir.SelectorExpr) int {
 	t := n.X.Type()
-	if !t.IsStruct() {
+	if !isStructNotSIMD(t) {
 		panic("ODOT's LHS is not a struct")
 	}
 
@@ -7714,7 +7971,7 @@ func (e *ssafn) SplitSlot(parent *ssa.LocalSlot, suffix string, offset int64, t 
 }
 
 // Logf logs a message from the compiler.
-func (e *ssafn) Logf(msg string, args ...interface{}) {
+func (e *ssafn) Logf(msg string, args ...any) {
 	if e.log {
 		fmt.Printf(msg, args...)
 	}
@@ -7725,15 +7982,15 @@ func (e *ssafn) Log() bool {
 }
 
 // Fatalf reports a compiler error and exits.
-func (e *ssafn) Fatalf(pos src.XPos, msg string, args ...interface{}) {
+func (e *ssafn) Fatalf(pos src.XPos, msg string, args ...any) {
 	base.Pos = pos
-	nargs := append([]interface{}{ir.FuncName(e.curfn)}, args...)
+	nargs := append([]any{ir.FuncName(e.curfn)}, args...)
 	base.Fatalf("'%s': "+msg, nargs...)
 }
 
 // Warnl reports a "warning", which is usually flag-triggered
 // logging output for the benefit of tests.
-func (e *ssafn) Warnl(pos src.XPos, fmt_ string, args ...interface{}) {
+func (e *ssafn) Warnl(pos src.XPos, fmt_ string, args ...any) {
 	base.WarnfAt(pos, fmt_, args...)
 }
 
@@ -7853,6 +8110,10 @@ func SpillSlotAddr(spill ssa.Spill, baseReg int16, extraOffset int64) obj.Addr {
 		Reg:    baseReg,
 		Offset: spill.Offset + extraOffset,
 	}
+}
+
+func isStructNotSIMD(t *types.Type) bool {
+	return t.IsStruct() && !t.IsSIMD()
 }
 
 var BoundsCheckFunc [ssa.BoundsKindCount]*obj.LSym

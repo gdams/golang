@@ -53,6 +53,10 @@ By default, 'go run' compiles the binary without generating the information
 used by debuggers, to reduce build time. To include debugger information in
 the binary, use 'go build'.
 
+The go command places $GOROOT/bin at the beginning of $PATH in the
+subprocess environment, so that subprocesses that execute 'go' commands
+use the same 'go' as their parent.
+
 The exit status of Run is not the exit status of the compiled binary.
 
 For more about build flags, see 'go help build'.
@@ -71,21 +75,22 @@ func init() {
 }
 
 func runRun(ctx context.Context, cmd *base.Command, args []string) {
+	moduleLoader := modload.NewLoader()
 	if shouldUseOutsideModuleMode(args) {
 		// Set global module flags for 'go run cmd@version'.
 		// This must be done before modload.Init, but we need to call work.BuildInit
 		// before loading packages, since it affects package locations, e.g.,
 		// for -race and -msan.
-		modload.LoaderState.ForceUseModules = true
-		modload.LoaderState.RootMode = modload.NoRoot
-		modload.AllowMissingModuleImports(modload.LoaderState)
-		modload.Init(modload.LoaderState)
+		moduleLoader.ForceUseModules = true
+		moduleLoader.RootMode = modload.NoRoot
+		moduleLoader.AllowMissingModuleImports()
+		modload.Init(moduleLoader)
 	} else {
-		modload.InitWorkfile(modload.LoaderState)
+		moduleLoader.InitWorkfile()
 	}
 
-	work.BuildInit(modload.LoaderState)
-	b := work.NewBuilder("")
+	work.BuildInit(moduleLoader)
+	b := work.NewBuilder("", moduleLoader.VendorDirOrEmpty)
 	defer func() {
 		if err := b.Close(); err != nil {
 			base.Fatal(err)
@@ -107,18 +112,18 @@ func runRun(ctx context.Context, cmd *base.Command, args []string) {
 				base.Fatalf("go: cannot run *_test.go files (%s)", file)
 			}
 		}
-		p = load.GoFilesPackage(modload.LoaderState, ctx, pkgOpts, files)
+		p = load.GoFilesPackage(moduleLoader, ctx, pkgOpts, files)
 	} else if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		arg := args[0]
 		var pkgs []*load.Package
 		if strings.Contains(arg, "@") && !build.IsLocalImport(arg) && !filepath.IsAbs(arg) {
 			var err error
-			pkgs, err = load.PackagesAndErrorsOutsideModule(modload.LoaderState, ctx, pkgOpts, args[:1])
+			pkgs, err = load.PackagesAndErrorsOutsideModule(moduleLoader, ctx, pkgOpts, args[:1])
 			if err != nil {
 				base.Fatal(err)
 			}
 		} else {
-			pkgs = load.PackagesAndErrors(modload.LoaderState, ctx, pkgOpts, args[:1])
+			pkgs = load.PackagesAndErrors(moduleLoader, ctx, pkgOpts, args[:1])
 		}
 
 		if len(pkgs) == 0 {
@@ -140,7 +145,7 @@ func runRun(ctx context.Context, cmd *base.Command, args []string) {
 	load.CheckPackageErrors([]*load.Package{p})
 
 	if cfg.BuildCover {
-		load.PrepareForCoverageBuild(modload.LoaderState, []*load.Package{p})
+		load.PrepareForCoverageBuild(moduleLoader, []*load.Package{p})
 	}
 
 	p.Internal.OmitDebug = true
@@ -166,7 +171,7 @@ func runRun(ctx context.Context, cmd *base.Command, args []string) {
 		p.Internal.ExeName = p.DefaultExecName()
 	}
 
-	a1 := b.LinkAction(modload.LoaderState, work.ModeBuild, work.ModeBuild, p)
+	a1 := b.LinkAction(moduleLoader, work.ModeBuild, work.ModeBuild, p)
 	a1.CacheExecutable = true
 	a := &work.Action{Mode: "go run", Actor: work.ActorFunc(buildRunProgram), Args: cmdArgs, Deps: []*work.Action{a1}}
 	b.Do(ctx, a)

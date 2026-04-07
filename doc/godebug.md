@@ -85,6 +85,9 @@ if the work module's `go.mod` or the workspace's `go.work`
 says `go` `1.20`, then the program defaults to `panicnil=1`,
 matching Go 1.20 instead of Go 1.21.
 
+As an exception, GODEBUGs introduced for security releases
+will have the new behavior apply to all versions.
+
 Because this method of setting GODEBUG defaults was introduced only in Go 1.21,
 programs listing versions of Go earlier than Go 1.20 are configured to match Go 1.20,
 not the older version.
@@ -133,9 +136,7 @@ are also treated as invalid.
 The defaults that will be compiled into a main package
 are reported by the command:
 
-{{raw `
 	go list -f '{{.DefaultGODEBUG}}' my/main/package
-`}}
 
 Only differences from the base Go toolchain defaults are reported.
 
@@ -153,6 +154,22 @@ for example,
 see the [runtime documentation](/pkg/runtime#hdr-Environment_Variables)
 and the [go command documentation](/cmd/go#hdr-Build_and_test_caching).
 
+### Go 1.27
+
+Go 1.27 removed the `gotypesalias` setting, as noted in the [Go 1.22](#go-122) section.
+
+Go 1.27 added a new `htmlmetacontenturlescape` setting that controls whether
+html/template will escape URLs in the `url=` portion of the content attribute of
+HTML meta tags. The default `htmlmetacontentescape=1` will cause URLs to be
+escaped. Setting `htmlmetacontentescape=0` disables this behavior. To avoid
+content injection attacks, this setting and default was backported to Go 1.25.8
+and Go 1.26.1.
+
+Go 1.27 changes the default for `tracebacklabels` (added in [Go 1.26](#go-126))
+to `1`. This opt-out is expected to be kept indefinitely in case goroutine
+labels acquire sensitive information that shouldn't be made available in
+tracebacks.
+
 ### Go 1.26
 
 Go 1.26 added a new `httpcookiemaxnum` setting that controls the maximum number
@@ -162,6 +179,33 @@ will fail early. The default value is `httpcookiemaxnum=3000`. Setting
 `httpcookiemaxnum=0` will allow the cookie parsing to accept an indefinite
 number of cookies. To avoid denial of service attacks, this setting and default
 was backported to Go 1.25.2 and Go 1.24.8.
+
+Go 1.26 added a new `urlmaxqueryparams` setting that controls the maximum number
+of query parameters that net/url will accept when parsing a URL-encoded query string.
+If the number of parameters exceeds the number set in `urlmaxqueryparams`,
+parsing will fail early. The default value is `urlmaxqueryparams=10000`.
+Setting `urlmaxqueryparams=0` disables the limit. To avoid denial of service
+attacks, this setting and default was backported to Go 1.25.6 and Go 1.24.12.
+
+Go 1.26 added a new `urlstrictcolons` setting that controls whether `net/url.Parse`
+allows malformed hostnames containing colons outside of a bracketed IPv6 address.
+The default `urlstrictcolons=1` rejects URLs such as `http://localhost:1:2` or `http://::1/`.
+Colons are permitted as part of a bracketed IPv6 address, such as `http://[::1]/`.
+
+Go 1.26 enabled two additional post-quantum key exchange mechanisms:
+SecP256r1MLKEM768 and SecP384r1MLKEM1024. The default can be reverted using the
+[`tlssecpmlkem` setting](/pkg/crypto/tls/#Config.CurvePreferences).
+
+Go 1.26 added a new `tracebacklabels` setting that controls the inclusion of
+goroutine labels set through the the `runtime/pprof` package. Setting `tracebacklabels=1`
+includes these key/value pairs in the goroutine status header of runtime
+tracebacks and debug=2 runtime/pprof stack dumps. This format may change in the future.
+(see go.dev/issue/76349)
+
+Go 1.26 added a new `cryptocustomrand` setting that controls whether most crypto/...
+APIs ignore the random `io.Reader` parameter. For Go 1.26, it defaults
+to `cryptocustomrand=0`, ignoring the random parameters. Using `cryptocustomrand=1`
+reverts to the pre-Go 1.26 behavior.
 
 ### Go 1.25
 
@@ -286,7 +330,7 @@ Go 1.23 changed the channels created by package time to be unbuffered
 and [`Timer.Reset`](/pkg/time/#Timer.Reset) method results much easier.
 The [`asynctimerchan` setting](/pkg/time/#NewTimer) disables this change.
 There are no runtime metrics for this change,
-This setting may be removed in a future release, Go 1.27 at the earliest.
+This setting will be removed in Go 1.27.
 
 Go 1.23 changed the mode bits reported by [`os.Lstat`](/pkg/os#Lstat) and [`os.Stat`](/pkg/os#Stat)
 for reparse points, which can be controlled with the `winsymlink` setting.
@@ -323,6 +367,7 @@ any effect.
 Go 1.23 changed the default TLS cipher suites used by clients and servers when
 not explicitly configured, removing 3DES cipher suites. The default can be reverted
 using the [`tls3des` setting](/pkg/crypto/tls/#Config.CipherSuites).
+This setting will be removed in Go 1.27.
 
 Go 1.23 changed the behavior of [`tls.X509KeyPair`](/pkg/crypto/tls#X509KeyPair)
 and [`tls.LoadX509KeyPair`](/pkg/crypto/tls#LoadX509KeyPair) to populate the
@@ -330,6 +375,7 @@ Leaf field of the returned [`tls.Certificate`](/pkg/crypto/tls#Certificate).
 This behavior is controlled by the `x509keypairleaf` setting. For Go 1.23, it
 defaults to `x509keypairleaf=1`. Previous versions default to
 `x509keypairleaf=0`.
+This setting will be removed in Go 1.27.
 
 Go 1.23 changed
 [`net/http.ServeContent`](/pkg/net/http#ServeContent),
@@ -363,21 +409,24 @@ Whether the type checker produces `Alias` types or not is controlled by the
 [`gotypesalias` setting](/pkg/go/types#Alias).
 For Go 1.22 it defaults to `gotypesalias=0`.
 For Go 1.23, `gotypesalias=1` will become the default.
-This setting will be removed in a future release, Go 1.27 at the earliest.
+This setting will be removed in Go 1.27.
 
 Go 1.22 changed the default minimum TLS version supported by both servers
 and clients to TLS 1.2. The default can be reverted to TLS 1.0 using the
 [`tls10server` setting](/pkg/crypto/tls/#Config).
+This setting will be removed in Go 1.27.
 
 Go 1.22 changed the default TLS cipher suites used by clients and servers when
 not explicitly configured, removing the cipher suites which used RSA based key
 exchange. The default can be reverted using the [`tlsrsakex` setting](/pkg/crypto/tls/#Config).
+This setting will be removed in Go 1.27.
 
 Go 1.22 disabled
 [`ConnectionState.ExportKeyingMaterial`](/pkg/crypto/tls/#ConnectionState.ExportKeyingMaterial)
 when the connection supports neither TLS 1.3 nor Extended Master Secret
 (implemented in Go 1.21). It can be reenabled with the [`tlsunsafeekm`
 setting](/pkg/crypto/tls/#ConnectionState.ExportKeyingMaterial).
+This setting will be removed in Go 1.27.
 
 Go 1.22 changed how the runtime interacts with transparent huge pages on Linux.
 In particular, a common default Linux kernel configuration can result in

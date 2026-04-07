@@ -57,11 +57,15 @@ func applyRewrite(f *Func, rb blockRewriter, rv valueRewriter, deadcode deadValu
 	var iters int
 	var states map[string]bool
 	for {
+		if debug > 1 {
+			fmt.Printf("%s: iter %d\n", f.pass.name, iters)
+		}
 		change := false
 		deadChange := false
 		for _, b := range f.Blocks {
 			var b0 *Block
 			if debug > 1 {
+				fmt.Printf("%s: start block\n", f.pass.name)
 				b0 = new(Block)
 				*b0 = *b
 				b0.Succs = append([]Edge{}, b.Succs...) // make a new copy, not aliasing
@@ -79,6 +83,9 @@ func applyRewrite(f *Func, rb blockRewriter, rv valueRewriter, deadcode deadValu
 				}
 			}
 			for j, v := range b.Values {
+				if debug > 1 {
+					fmt.Printf("%s: consider %v\n", f.pass.name, v.LongString())
+				}
 				var v0 *Value
 				if debug > 1 {
 					v0 = new(Value)
@@ -473,7 +480,7 @@ func isSpecializedMalloc(aux Aux) bool {
 	name := fn.String()
 	return strings.HasPrefix(name, "runtime.mallocgcSmallNoScanSC") ||
 		strings.HasPrefix(name, "runtime.mallocgcSmallScanNoHeaderSC") ||
-		strings.HasPrefix(name, "runtime.mallocTiny")
+		strings.HasPrefix(name, "runtime.mallocgcTinySize")
 }
 
 // canLoadUnaligned reports if the architecture supports unaligned load operations.
@@ -511,20 +518,15 @@ func log32(n int32) int64 { return log32u(uint32(n)) }
 func log64(n int64) int64 { return log64u(uint64(n)) }
 
 // logXu returns the logarithm of n base 2.
-// n must be a power of 2 (isUnsignedPowerOfTwo returns true)
+// n must be a power of 2 (isPowerOfTwo returns true)
 func log8u(n uint8) int64   { return int64(bits.Len8(n)) - 1 }
 func log16u(n uint16) int64 { return int64(bits.Len16(n)) - 1 }
 func log32u(n uint32) int64 { return int64(bits.Len32(n)) - 1 }
 func log64u(n uint64) int64 { return int64(bits.Len64(n)) - 1 }
 
 // isPowerOfTwoX functions report whether n is a power of 2.
-func isPowerOfTwo[T int8 | int16 | int32 | int64](n T) bool {
+func isPowerOfTwo[T int8 | int16 | int32 | int64 | uint8 | uint16 | uint32 | uint64](n T) bool {
 	return n > 0 && n&(n-1) == 0
-}
-
-// isUnsignedPowerOfTwo reports whether n is an unsigned power of 2.
-func isUnsignedPowerOfTwo[T uint8 | uint16 | uint32 | uint64](n T) bool {
-	return n != 0 && n&(n-1) == 0
 }
 
 // is32Bit reports whether n can be represented as a signed 32 bit integer.
@@ -757,6 +759,7 @@ func arm64ConditionalParamsToAuxInt(v arm64ConditionalParams) int64 {
 	i |= int64(v.cond)
 	return i
 }
+
 func flagConstantToAuxInt(x flagConstant) int64 {
 	return int64(x)
 }
@@ -941,7 +944,8 @@ func disjointTypes(t1 *types.Type, t2 *types.Type) bool {
 	}
 
 	if !t1.IsPtr() || !t2.IsPtr() {
-		panic("disjointTypes: one of arguments is not a pointer")
+		// Treat non-pointer types (such as TFUNC, TMAP, uintptr) conservatively.
+		return false
 	}
 
 	t1 = t1.Elem()
@@ -1255,10 +1259,8 @@ func logRule(s string) {
 		}
 		ruleFile = w
 	}
-	_, err := fmt.Fprintln(ruleFile, s)
-	if err != nil {
-		panic(err)
-	}
+	// Ignore errors in case of multiple processes fighting over the file.
+	fmt.Fprintln(ruleFile, s)
 }
 
 var ruleFile io.Writer
@@ -1350,7 +1352,7 @@ func overlap(offset1, size1, offset2, size2 int64) bool {
 // check if value zeroes out upper 32-bit of 64-bit register.
 // depth limits recursion depth. In AMD64.rules 3 is used as limit,
 // because it catches same amount of cases as 4.
-func zeroUpper32Bits(x *Value, depth int) bool {
+func ZeroUpper32Bits(x *Value, depth int) bool {
 	if x.Type.IsSigned() && x.Type.Size() < 8 {
 		// If the value is signed, it might get re-sign-extended
 		// during spill and restore. See issue 68227.
@@ -1367,6 +1369,8 @@ func zeroUpper32Bits(x *Value, depth int) bool {
 		OpAMD64SHRL, OpAMD64SHRLconst, OpAMD64SARL, OpAMD64SARLconst,
 		OpAMD64SHLL, OpAMD64SHLLconst:
 		return true
+	case OpAMD64MOVQconst:
+		return uint64(uint32(x.AuxInt)) == uint64(x.AuxInt)
 	case OpARM64REV16W, OpARM64REVW, OpARM64RBITW, OpARM64CLZW, OpARM64EXTRWconst,
 		OpARM64MULW, OpARM64MNEGW, OpARM64UDIVW, OpARM64DIVW, OpARM64UMODW,
 		OpARM64MADDW, OpARM64MSUBW, OpARM64RORW, OpARM64RORWconst:
@@ -1382,7 +1386,7 @@ func zeroUpper32Bits(x *Value, depth int) bool {
 			return false
 		}
 		for i := range x.Args {
-			if !zeroUpper32Bits(x.Args[i], depth-1) {
+			if !ZeroUpper32Bits(x.Args[i], depth-1) {
 				return false
 			}
 		}
@@ -1392,14 +1396,16 @@ func zeroUpper32Bits(x *Value, depth int) bool {
 	return false
 }
 
-// zeroUpper48Bits is similar to zeroUpper32Bits, but for upper 48 bits.
-func zeroUpper48Bits(x *Value, depth int) bool {
+// ZeroUpper48Bits is similar to ZeroUpper32Bits, but for upper 48 bits.
+func ZeroUpper48Bits(x *Value, depth int) bool {
 	if x.Type.IsSigned() && x.Type.Size() < 8 {
 		return false
 	}
 	switch x.Op {
 	case OpAMD64MOVWQZX, OpAMD64MOVWload, OpAMD64MOVWloadidx1, OpAMD64MOVWloadidx2:
 		return true
+	case OpAMD64MOVQconst, OpAMD64MOVLconst:
+		return uint64(uint16(x.AuxInt)) == uint64(x.AuxInt)
 	case OpArg: // note: but not ArgIntReg
 		return x.Type.Size() == 2 && x.Block.Func.Config.arch == "amd64"
 	case OpPhi, OpSelect0, OpSelect1:
@@ -1409,7 +1415,7 @@ func zeroUpper48Bits(x *Value, depth int) bool {
 			return false
 		}
 		for i := range x.Args {
-			if !zeroUpper48Bits(x.Args[i], depth-1) {
+			if !ZeroUpper48Bits(x.Args[i], depth-1) {
 				return false
 			}
 		}
@@ -1419,14 +1425,16 @@ func zeroUpper48Bits(x *Value, depth int) bool {
 	return false
 }
 
-// zeroUpper56Bits is similar to zeroUpper32Bits, but for upper 56 bits.
-func zeroUpper56Bits(x *Value, depth int) bool {
+// ZeroUpper56Bits is similar to ZeroUpper32Bits, but for upper 56 bits.
+func ZeroUpper56Bits(x *Value, depth int) bool {
 	if x.Type.IsSigned() && x.Type.Size() < 8 {
 		return false
 	}
 	switch x.Op {
 	case OpAMD64MOVBQZX, OpAMD64MOVBload, OpAMD64MOVBloadidx1:
 		return true
+	case OpAMD64MOVQconst, OpAMD64MOVLconst:
+		return uint64(uint8(x.AuxInt)) == uint64(x.AuxInt)
 	case OpArg: // note: but not ArgIntReg
 		return x.Type.Size() == 1 && x.Block.Func.Config.arch == "amd64"
 	case OpPhi, OpSelect0, OpSelect1:
@@ -1436,7 +1444,7 @@ func zeroUpper56Bits(x *Value, depth int) bool {
 			return false
 		}
 		for i := range x.Args {
-			if !zeroUpper56Bits(x.Args[i], depth-1) {
+			if !ZeroUpper56Bits(x.Args[i], depth-1) {
 				return false
 			}
 		}
@@ -1476,11 +1484,13 @@ func isInlinableMemmove(dst, src *Value, sz int64, c *Config) bool {
 		return sz <= 16 || (sz < 1024 && disjoint(dst, sz, src, sz))
 	case "arm64":
 		return sz <= 64 || (sz <= 1024 && disjoint(dst, sz, src, sz))
+	case "loong64":
+		return sz <= 16 || (sz <= 64 && disjoint(dst, sz, src, sz))
 	case "386":
 		return sz <= 8
 	case "s390x", "ppc64", "ppc64le":
 		return sz <= 8 || disjoint(dst, sz, src, sz)
-	case "arm", "loong64", "mips", "mips64", "mipsle", "mips64le":
+	case "arm", "mips", "mips64", "mipsle", "mips64le":
 		return sz <= 4
 	}
 	return false
@@ -1946,7 +1956,7 @@ func arm64BFWidth(mask, rshift int64) int64 {
 	return nto(shiftedMask)
 }
 
-// encodes condition code and NZCV flags into auxint.
+// encodes condition code and NZCV flags into result.
 func arm64ConditionalParamsAuxInt(cond Op, nzcv uint8) arm64ConditionalParams {
 	if cond < OpARM64Equal || cond > OpARM64GreaterEqualU {
 		panic("Wrong conditional operation")
@@ -2163,11 +2173,11 @@ func rewriteFixedLoad(v *Value, sym Sym, sb *Value, off int64) *Value {
 					return v
 				case "Hash":
 					v.reset(OpConst32)
-					v.AuxInt = int64(types.TypeHash(t))
+					v.AuxInt = int64(int32(types.TypeHash(t)))
 					return v
 				case "Kind_":
 					v.reset(OpConst8)
-					v.AuxInt = int64(reflectdata.ABIKindOfType(t))
+					v.AuxInt = int64(int8(reflectdata.ABIKindOfType(t)))
 					return v
 				case "GCData":
 					gcdata, _ := reflectdata.GCSym(t, true)
@@ -2619,55 +2629,57 @@ func rewriteStructStore(v *Value) *Value {
 	return mem
 }
 
-// isDirectType reports whether v represents a type
+// isDirectAndComparableType reports whether v represents a type
 // (a *runtime._type) whose value is stored directly in an
-// interface (i.e., is pointer or pointer-like).
-func isDirectType(v *Value) bool {
-	return isDirectType1(v)
+// interface (i.e., is pointer or pointer-like) and is comparable.
+func isDirectAndComparableType(v *Value) bool {
+	return isDirectAndComparableType1(v)
 }
 
 // v is a type
-func isDirectType1(v *Value) bool {
+func isDirectAndComparableType1(v *Value) bool {
 	switch v.Op {
 	case OpITab:
-		return isDirectType2(v.Args[0])
+		return isDirectAndComparableType2(v.Args[0])
 	case OpAddr:
 		lsym := v.Aux.(*obj.LSym)
 		if ti := lsym.TypeInfo(); ti != nil {
-			return types.IsDirectIface(ti.Type.(*types.Type))
+			t := ti.Type.(*types.Type)
+			return types.IsDirectIface(t) && types.IsComparable(t)
 		}
 	}
 	return false
 }
 
 // v is an empty interface
-func isDirectType2(v *Value) bool {
+func isDirectAndComparableType2(v *Value) bool {
 	switch v.Op {
 	case OpIMake:
-		return isDirectType1(v.Args[0])
+		return isDirectAndComparableType1(v.Args[0])
 	}
 	return false
 }
 
-// isDirectIface reports whether v represents an itab
+// isDirectAndComparableIface reports whether v represents an itab
 // (a *runtime._itab) for a type whose value is stored directly
-// in an interface (i.e., is pointer or pointer-like).
-func isDirectIface(v *Value) bool {
-	return isDirectIface1(v, 9)
+// in an interface (i.e., is pointer or pointer-like) and is comparable.
+func isDirectAndComparableIface(v *Value) bool {
+	return isDirectAndComparableIface1(v, 9)
 }
 
 // v is an itab
-func isDirectIface1(v *Value, depth int) bool {
+func isDirectAndComparableIface1(v *Value, depth int) bool {
 	if depth == 0 {
 		return false
 	}
 	switch v.Op {
 	case OpITab:
-		return isDirectIface2(v.Args[0], depth-1)
+		return isDirectAndComparableIface2(v.Args[0], depth-1)
 	case OpAddr:
 		lsym := v.Aux.(*obj.LSym)
 		if ii := lsym.ItabInfo(); ii != nil {
-			return types.IsDirectIface(ii.Type.(*types.Type))
+			t := ii.Type.(*types.Type)
+			return types.IsDirectIface(t) && types.IsComparable(t)
 		}
 	case OpConstNil:
 		// We can treat this as direct, because if the itab is
@@ -2678,16 +2690,16 @@ func isDirectIface1(v *Value, depth int) bool {
 }
 
 // v is an interface
-func isDirectIface2(v *Value, depth int) bool {
+func isDirectAndComparableIface2(v *Value, depth int) bool {
 	if depth == 0 {
 		return false
 	}
 	switch v.Op {
 	case OpIMake:
-		return isDirectIface1(v.Args[0], depth-1)
+		return isDirectAndComparableIface1(v.Args[0], depth-1)
 	case OpPhi:
 		for _, a := range v.Args {
-			if !isDirectIface2(a, depth-1) {
+			if !isDirectAndComparableIface2(a, depth-1) {
 				return false
 			}
 		}
@@ -2763,4 +2775,80 @@ func panicBoundsCCToAux(p PanicBoundsCC) Aux {
 
 func isDictArgSym(sym Sym) bool {
 	return sym.(*ir.Name).Sym().Name == typecheck.LocalDictName
+}
+
+// When v is (IMake typ (StructMake ...)), convert to
+// (IMake typ arg) where arg is the pointer-y argument to
+// the StructMake (there must be exactly one).
+func imakeOfStructMake(v *Value) *Value {
+	var arg *Value
+	for _, a := range v.Args[1].Args {
+		if a.Type.Size() > 0 {
+			arg = a
+			break
+		}
+	}
+	return v.Block.NewValue2(v.Pos, OpIMake, v.Type, v.Args[0], arg)
+}
+
+// bool2int converts bool to int: true to 1, false to 0
+func bool2int(x bool) int {
+	var b int
+	if x {
+		b = 1
+	}
+	return b
+}
+
+// rewriteCondSelectIntoMath reports whether x OP (y * constant) should be used instead of a CondSelect.
+// x arbitrary, y in [0,1]
+func rewriteCondSelectIntoMath(config *Config, op Op, constant int64) bool {
+	switch config.arch {
+	case "amd64":
+		if constant == 1 {
+			return true
+		}
+		switch op {
+		case OpAdd64, OpAdd32, OpAdd16, OpAdd8:
+			switch constant {
+			case 2, 4, 8:
+				// Implemented with LEA a + b * displacement form
+				return true
+			}
+		}
+	case "arm64":
+		switch op {
+		case OpAdd64, OpAdd32, OpAdd16, OpAdd8:
+			if constant == 1 {
+				return false // better done as CSINC
+			}
+			fallthrough
+		case OpSub64, OpSub32, OpSub16, OpSub8,
+			OpAnd64, OpAnd32, OpAnd16, OpAnd8,
+			OpOr64, OpOr32, OpOr16, OpOr8,
+			OpXor64, OpXor32, OpXor16, OpXor8:
+			// Implemented using an inline LSL
+			return isPowerOfTwo(uint64(constant))
+		default:
+			if constant == 1 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func addToSub(op Op) Op {
+	switch op {
+	case OpAdd64:
+		return OpSub64
+	case OpAdd32:
+		return OpSub32
+	case OpAdd16:
+		return OpSub16
+	case OpAdd8:
+		return OpSub8
+	default:
+		panic(fmt.Sprintf("unexpected op %v", op))
+	}
 }

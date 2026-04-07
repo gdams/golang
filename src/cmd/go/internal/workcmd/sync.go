@@ -48,19 +48,20 @@ func init() {
 }
 
 func runSync(ctx context.Context, cmd *base.Command, args []string) {
-	modload.LoaderState.ForceUseModules = true
-	modload.InitWorkfile(modload.LoaderState)
-	if modload.WorkFilePath(modload.LoaderState) == "" {
+	moduleLoader := modload.NewLoader()
+	moduleLoader.ForceUseModules = true
+	moduleLoader.InitWorkfile()
+	if modload.WorkFilePath(moduleLoader) == "" {
 		base.Fatalf("go: no go.work file found\n\t(run 'go work init' first or specify path using GOWORK environment variable)")
 	}
 
-	_, err := modload.LoadModGraph(modload.LoaderState, ctx, "")
+	_, err := modload.LoadModGraph(moduleLoader, ctx, "")
 	if err != nil {
-		toolchain.SwitchOrFatal(modload.LoaderState, ctx, err)
+		toolchain.SwitchOrFatal(moduleLoader, ctx, err)
 	}
 	mustSelectFor := map[module.Version][]module.Version{}
 
-	mms := modload.LoaderState.MainModules
+	mms := moduleLoader.MainModules
 
 	opts := modload.PackageOpts{
 		Tags:                     imports.AnyTags(),
@@ -73,7 +74,7 @@ func runSync(ctx context.Context, cmd *base.Command, args []string) {
 	}
 	for _, m := range mms.Versions() {
 		opts.MainModule = m
-		_, pkgs := modload.LoadPackages(modload.LoaderState, ctx, opts, "all")
+		_, pkgs := modload.LoadPackages(moduleLoader, ctx, opts, "all")
 		opts.MainModule = module.Version{} // reset
 
 		var (
@@ -81,7 +82,7 @@ func runSync(ctx context.Context, cmd *base.Command, args []string) {
 			inMustSelect = map[module.Version]bool{}
 		)
 		for _, pkg := range pkgs {
-			if r := modload.PackageModule(pkg); r.Version != "" && !inMustSelect[r] {
+			if r := moduleLoader.PackageModule(pkg); r.Version != "" && !inMustSelect[r] {
 				// r has a known version, so force that version.
 				mustSelect = append(mustSelect, r)
 				inMustSelect[r] = true
@@ -91,7 +92,7 @@ func runSync(ctx context.Context, cmd *base.Command, args []string) {
 		mustSelectFor[m] = mustSelect
 	}
 
-	workFilePath := modload.WorkFilePath(modload.LoaderState) // save go.work path because EnterModule clobbers it.
+	workFilePath := modload.WorkFilePath(moduleLoader) // save go.work path because EnterModule clobbers it.
 
 	var goV string
 	for _, m := range mms.Versions() {
@@ -104,7 +105,7 @@ func runSync(ctx context.Context, cmd *base.Command, args []string) {
 
 		// Use EnterModule to reset the global state in modload to be in
 		// single-module mode using the modroot of m.
-		modload.EnterModule(modload.LoaderState, ctx, mms.ModRoot(m))
+		modload.EnterModule(moduleLoader, ctx, mms.ModRoot(m))
 
 		// Edit the build list in the same way that 'go get' would if we
 		// requested the relevant module versions explicitly.
@@ -114,12 +115,12 @@ func runSync(ctx context.Context, cmd *base.Command, args []string) {
 		// so we don't write some go.mods with the "before" toolchain
 		// and others with the "after" toolchain. If nothing else, that
 		// discrepancy could show up in auto-recorded toolchain lines.
-		changed, err := modload.EditBuildList(modload.LoaderState, ctx, nil, mustSelectFor[m])
+		changed, err := modload.EditBuildList(moduleLoader, ctx, nil, mustSelectFor[m])
 		if err != nil {
 			continue
 		}
 		if changed {
-			modload.LoadPackages(modload.LoaderState, ctx, modload.PackageOpts{
+			modload.LoadPackages(moduleLoader, ctx, modload.PackageOpts{
 				Tags:                     imports.AnyTags(),
 				Tidy:                     true,
 				VendorModulesInGOROOTSrc: true,
@@ -129,9 +130,9 @@ func runSync(ctx context.Context, cmd *base.Command, args []string) {
 				SilenceMissingStdImports: true,
 				SilencePackageErrors:     true,
 			}, "all")
-			modload.WriteGoMod(modload.LoaderState, ctx, modload.WriteOpts{})
+			modload.WriteGoMod(moduleLoader, ctx, modload.WriteOpts{})
 		}
-		goV = gover.Max(goV, modload.LoaderState.MainModules.GoVersion(modload.LoaderState))
+		goV = gover.Max(goV, moduleLoader.MainModules.GoVersion(moduleLoader))
 	}
 
 	wf, err := modload.ReadWorkFile(workFilePath)

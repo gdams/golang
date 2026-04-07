@@ -67,7 +67,7 @@ var (
 
 	// dirs are the directories to look for *.go files in.
 	// TODO(bradfitz): just use all directories?
-	dirs = []string{".", "ken", "chan", "interface", "internal/runtime/sys", "syntax", "dwarf", "fixedbugs", "codegen", "abi", "typeparam", "typeparam/mdempsky", "arenas"}
+	dirs = []string{".", "ken", "chan", "interface", "internal/runtime/sys", "syntax", "dwarf", "fixedbugs", "codegen", "abi", "typeparam", "typeparam/mdempsky", "arenas", "simd"}
 )
 
 // Test is the main entrypoint that runs tests in the GOROOT/test directory.
@@ -696,6 +696,7 @@ func (t test) run() error {
 		// against a set of regexps in comments.
 		ops := t.wantedAsmOpcodes(long)
 		self := runtime.GOOS + "/" + runtime.GOARCH
+		var lastErr error
 		for _, env := range ops.Envs() {
 			// Only run checks relevant to the current GOOS/GOARCH,
 			// to avoid triggering a cross-compile of the runtime.
@@ -733,14 +734,19 @@ func (t test) run() error {
 			var buf bytes.Buffer
 			cmd.Stdout, cmd.Stderr = &buf, &buf
 			if err := cmd.Run(); err != nil {
+				lastErr = err
 				t.Log(env, "\n", cmd.Stderr)
-				return err
 			}
 
 			err := t.asmCheck(buf.String(), long, env, ops[env])
 			if err != nil {
-				return err
+				lastErr = err
+				t.Log(err)
 			}
+		}
+		// The error(s) have been logged earlier. Pass up a generic one.
+		if lastErr != nil {
+			return errors.New("One or more asmcheck tests failed. Check log for failure details.")
 		}
 		return nil
 
@@ -1394,10 +1400,11 @@ type wantedError struct {
 }
 
 var (
-	errRx       = regexp.MustCompile(`// (?:GC_)?ERROR (.*)`)
-	errAutoRx   = regexp.MustCompile(`// (?:GC_)?ERRORAUTO (.*)`)
-	errQuotesRx = regexp.MustCompile(`"([^"]*)"`)
-	lineRx      = regexp.MustCompile(`LINE(([+-])(\d+))?`)
+	errRx            = regexp.MustCompile(`// (?:GC_)?ERROR (.*)`)
+	errAutoRx        = regexp.MustCompile(`// (?:GC_)?ERRORAUTO (.*)`)
+	errQuotesRx      = regexp.MustCompile(`"([^"]*)"`)
+	lineRx           = regexp.MustCompile(`LINE(([+-])(\d+))?`)
+	possibleOpcodeRx = regexp.MustCompile(`([A-Z][A-Z]|[IF](32|64))`) // two caps, or a wasm prefix
 )
 
 func (t test) wantedErrors(file, short string) (errs []wantedError) {
@@ -1477,7 +1484,7 @@ var (
 	// followed by semi-colon, followed by a comma-separated list of opcode checks.
 	// Extraneous spaces are ignored.
 	//
-	// An example: arm64/v8.1 : -`ADD` , `SUB`
+	// An example: arm64/v8.1 : -`ADD` `SUB`
 	//	"(\w+)" matches "arm64" (architecture name)
 	//	"(/[\w.]+)?" matches "v8.1" (architecture version)
 	//	"(/\w*)?" doesn't match anything here (it's an optional part of the triplet)
@@ -1485,10 +1492,10 @@ var (
 	//	"(" starts a capturing group
 	//      first reMatchCheck matches "-`ADD`"
 	//	`(?:" starts a non-capturing group
-	//	"\s*,\s*` matches " , "
+	//	"[\s,]+" matches " "
 	//	second reMatchCheck matches "`SUB`"
-	//	")*)" closes started groups; "*" means that there might be other elements in the comma-separated list
-	rxAsmPlatform = regexp.MustCompile(`(\w+)(/[\w.]+)?(/\w*)?\s*:\s*(` + reMatchCheck + `(?:\s*,\s*` + reMatchCheck + `)*)`)
+	//	")*)" closes started groups; "*" means that there might be other elements in the space-separated list
+	rxAsmPlatform = regexp.MustCompile(`(\w+)(/[\w.]+)?(/\w*)?\s*:\s*(` + reMatchCheck + `(?:[\s,]+` + reMatchCheck + `)*)`)
 
 	// Regexp to extract a single opcoded check
 	rxAsmCheck = regexp.MustCompile(reMatchCheck)
@@ -1582,9 +1589,10 @@ func (t test) wantedAsmOpcodes(fn string) asmChecks {
 		// Parse and extract any architecture check from comments,
 		// made by one architecture name and multiple checks.
 		lnum := fn + ":" + strconv.Itoa(i+1)
+		lastUsed := 0
 		for _, ac := range rxAsmPlatform.FindAllStringSubmatch(comment, -1) {
 			archspec, allchecks := ac[1:4], ac[4]
-
+			lastUsed = strings.LastIndex(comment, allchecks) + len(allchecks)
 			var arch, subarch, os string
 			switch {
 			case archspec[2] != "": // 3 components: "linux/386/sse2"
@@ -1670,6 +1678,22 @@ func (t test) wantedAsmOpcodes(fn string) asmChecks {
 				}
 			}
 		}
+		if lastUsed > 0 {
+			// There was an asm spec in this comment. Check for possible syntax
+			// errors, which would leave some asm patterns unused. We want
+			//  to allow some tail, for example for English comments. The
+			// hueristic we use here is we look for two consecutive capital
+			// letters (or a wasm prefix). Those are probably assembly mnemonics
+			// that weren't used.
+			tail := comment[lastUsed:]
+			if possibleOpcodeRx.MatchString(tail) {
+				t.Errorf("%s:%d: possible unused assembly pattern: %v", t.goFileName(), i+1, tail)
+			} else if strings.Count(comment, "\"")%2 != 0 || strings.Count(comment, "`")%2 != 0 {
+				t.Errorf("%s:%d: unbalanced quotes: %v", t.goFileName(), i+1, comment)
+			} else if strings.Contains(comment, "\",") || strings.Contains(comment, "`,") {
+				t.Errorf("%s:%d: comma separator - use space instead: %v", t.goFileName(), i+1, comment)
+			}
+		}
 		comment = ""
 	}
 
@@ -1700,6 +1724,9 @@ func (t test) asmCheck(outStr string, fn string, env buildEnv, fullops map[strin
 			continue
 		}
 		srcFileLine, asm := matches[1], matches[2]
+
+		// Replace tabs with single spaces to make matches easier to write.
+		asm = strings.ReplaceAll(asm, "\t", " ")
 
 		// Associate the original file/line information to the current
 		// function in the output; it will be useful to dump it in case
@@ -1752,11 +1779,11 @@ func (t test) asmCheck(outStr string, fn string, env buildEnv, fullops map[strin
 		}
 
 		if o.negative {
-			fmt.Fprintf(&errbuf, "%s:%d: %s: wrong opcode found: %q\n", t.goFileName(), o.line, env, o.opcode.String())
+			fmt.Fprintf(&errbuf, "%s:%d: %s: wrong opcode found: %#q\n", t.goFileName(), o.line, env, o.opcode.String())
 		} else if o.expected > 0 {
-			fmt.Fprintf(&errbuf, "%s:%d: %s: wrong number of opcodes: %q\n", t.goFileName(), o.line, env, o.opcode.String())
+			fmt.Fprintf(&errbuf, "%s:%d: %s: wrong number of opcodes: %#q\n", t.goFileName(), o.line, env, o.opcode.String())
 		} else {
-			fmt.Fprintf(&errbuf, "%s:%d: %s: opcode not found: %q\n", t.goFileName(), o.line, env, o.opcode.String())
+			fmt.Fprintf(&errbuf, "%s:%d: %s: opcode not found: %#q\n", t.goFileName(), o.line, env, o.opcode.String())
 		}
 	}
 	return errors.New(errbuf.String())

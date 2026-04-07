@@ -47,9 +47,6 @@ var driversMu sync.RWMutex
 //go:linkname drivers
 var drivers = make(map[string]driver.Driver)
 
-// nowFunc returns the current time; it's overridden in tests.
-var nowFunc = time.Now
-
 // Register makes a database driver available by the provided name.
 // If Register is called twice with the same name or if driver is nil,
 // it panics.
@@ -202,8 +199,9 @@ func (ns *NullString) Scan(value any) error {
 		ns.String, ns.Valid = "", false
 		return nil
 	}
-	ns.Valid = true
-	return convertAssign(&ns.String, value)
+	err := convertAssign(&ns.String, value)
+	ns.Valid = err == nil
+	return err
 }
 
 // Value implements the [driver.Valuer] interface.
@@ -228,8 +226,9 @@ func (n *NullInt64) Scan(value any) error {
 		n.Int64, n.Valid = 0, false
 		return nil
 	}
-	n.Valid = true
-	return convertAssign(&n.Int64, value)
+	err := convertAssign(&n.Int64, value)
+	n.Valid = err == nil
+	return err
 }
 
 // Value implements the [driver.Valuer] interface.
@@ -254,8 +253,9 @@ func (n *NullInt32) Scan(value any) error {
 		n.Int32, n.Valid = 0, false
 		return nil
 	}
-	n.Valid = true
-	return convertAssign(&n.Int32, value)
+	err := convertAssign(&n.Int32, value)
+	n.Valid = err == nil
+	return err
 }
 
 // Value implements the [driver.Valuer] interface.
@@ -334,8 +334,9 @@ func (n *NullFloat64) Scan(value any) error {
 		n.Float64, n.Valid = 0, false
 		return nil
 	}
-	n.Valid = true
-	return convertAssign(&n.Float64, value)
+	err := convertAssign(&n.Float64, value)
+	n.Valid = err == nil
+	return err
 }
 
 // Value implements the [driver.Valuer] interface.
@@ -360,8 +361,9 @@ func (n *NullBool) Scan(value any) error {
 		n.Bool, n.Valid = false, false
 		return nil
 	}
-	n.Valid = true
-	return convertAssign(&n.Bool, value)
+	err := convertAssign(&n.Bool, value)
+	n.Valid = err == nil
+	return err
 }
 
 // Value implements the [driver.Valuer] interface.
@@ -386,8 +388,9 @@ func (n *NullTime) Scan(value any) error {
 		n.Time, n.Valid = time.Time{}, false
 		return nil
 	}
-	n.Valid = true
-	return convertAssign(&n.Time, value)
+	err := convertAssign(&n.Time, value)
+	n.Valid = err == nil
+	return err
 }
 
 // Value implements the [driver.Valuer] interface.
@@ -422,8 +425,9 @@ func (n *Null[T]) Scan(value any) error {
 		n.V, n.Valid = *new(T), false
 		return nil
 	}
-	n.Valid = true
-	return convertAssign(&n.V, value)
+	err := convertAssign(&n.V, value)
+	n.Valid = err == nil
+	return err
 }
 
 func (n Null[T]) Value() (driver.Value, error) {
@@ -588,7 +592,7 @@ func (dc *driverConn) expired(timeout time.Duration) bool {
 	if timeout <= 0 {
 		return false
 	}
-	return dc.createdAt.Add(timeout).Before(nowFunc())
+	return dc.createdAt.Add(timeout).Before(time.Now())
 }
 
 // resetSession checks if the driver connection needs the
@@ -1144,7 +1148,7 @@ func (db *DB) connectionCleanerRunLocked(d time.Duration) (time.Duration, []*dri
 	if db.maxIdleTime > 0 {
 		// As freeConn is ordered by returnedAt process
 		// in reverse order to minimise the work needed.
-		idleSince := nowFunc().Add(-db.maxIdleTime)
+		idleSince := time.Now().Add(-db.maxIdleTime)
 		last := len(db.freeConn) - 1
 		for i := last; i >= 0; i-- {
 			c := db.freeConn[i]
@@ -1169,7 +1173,7 @@ func (db *DB) connectionCleanerRunLocked(d time.Duration) (time.Duration, []*dri
 	}
 
 	if db.maxLifetime > 0 {
-		expiredSince := nowFunc().Add(-db.maxLifetime)
+		expiredSince := time.Now().Add(-db.maxLifetime)
 		for i := 0; i < len(db.freeConn); i++ {
 			c := db.freeConn[i]
 			if c.createdAt.Before(expiredSince) {
@@ -1290,8 +1294,8 @@ func (db *DB) openNewConnection(ctx context.Context) {
 	}
 	dc := &driverConn{
 		db:         db,
-		createdAt:  nowFunc(),
-		returnedAt: nowFunc(),
+		createdAt:  time.Now(),
+		returnedAt: time.Now(),
 		ci:         ci,
 	}
 	if db.putConnDBLocked(dc, err) {
@@ -1363,7 +1367,7 @@ func (db *DB) conn(ctx context.Context, strategy connReuseStrategy) (*driverConn
 		db.waitCount++
 		db.mu.Unlock()
 
-		waitStart := nowFunc()
+		waitStart := time.Now()
 
 		// Timeout the connection request with the context.
 		select {
@@ -1439,8 +1443,8 @@ func (db *DB) conn(ctx context.Context, strategy connReuseStrategy) (*driverConn
 	db.mu.Lock()
 	dc := &driverConn{
 		db:         db,
-		createdAt:  nowFunc(),
-		returnedAt: nowFunc(),
+		createdAt:  time.Now(),
+		returnedAt: time.Now(),
 		ci:         ci,
 		inUse:      true,
 	}
@@ -1501,7 +1505,7 @@ func (db *DB) putConn(dc *driverConn, err error, resetSession bool) {
 		db.lastPut[dc] = stack()
 	}
 	dc.inUse = false
-	dc.returnedAt = nowFunc()
+	dc.returnedAt = time.Now()
 
 	for _, fn := range dc.onPut {
 		fn()
@@ -1979,7 +1983,7 @@ type Conn struct {
 	// closemu prevents the connection from closing while there
 	// is an active query. It is held for read during queries
 	// and exclusively during close.
-	closemu sync.RWMutex
+	closemu closingMutex
 
 	// dc is owned until close, at which point
 	// it's returned to the connection pool.
@@ -2169,7 +2173,7 @@ type Tx struct {
 	// closemu prevents the transaction from closing while there
 	// is an active query. It is held for read during queries
 	// and exclusively during close.
-	closemu sync.RWMutex
+	closemu closingMutex
 
 	// dc is owned exclusively until Commit or Rollback, at which point
 	// it's returned with putConn.
@@ -2606,7 +2610,7 @@ type Stmt struct {
 	query     string // that created the Stmt
 	stickyErr error  // if non-nil, this error is returned for all operations
 
-	closemu sync.RWMutex // held exclusively during close, for read otherwise.
+	closemu closingMutex // held exclusively during close, for read otherwise.
 
 	// If Stmt is prepared on a Tx or Conn then cg is present and will
 	// only ever grab a connection from cg.
@@ -2940,7 +2944,7 @@ type Rows struct {
 	// and exclusively during close.
 	//
 	// closemu guards lasterr and closed.
-	closemu sync.RWMutex
+	closemu closingMutex
 	lasterr error // non-nil only if closed is true
 	closed  bool
 
@@ -3037,9 +3041,11 @@ func (rs *Rows) Next() bool {
 	}
 
 	var doClose, ok bool
-	withLock(rs.closemu.RLocker(), func() {
+	func() {
+		rs.closemu.RLock()
+		defer rs.closemu.RUnlock()
 		doClose, ok = rs.nextLocked()
-	})
+	}()
 	if doClose {
 		rs.Close()
 	}
@@ -3396,16 +3402,7 @@ func (rs *Rows) scanLocked(dest ...any) error {
 	}
 
 	for i, sv := range rs.lastcols {
-		err := driver.ErrSkip
-
-		if rcs, ok := rs.rowsi.(driver.RowsColumnScanner); ok {
-			err = rcs.ScanColumn(dest[i], i)
-		}
-
-		if err == driver.ErrSkip {
-			err = convertAssignRows(dest[i], sv, rs)
-		}
-
+		err := convertAssignRows(dest[i], sv, rs)
 		if err != nil {
 			return fmt.Errorf(`sql: Scan error on column index %d, name %q: %w`, i, rs.rowsi.Columns()[i], err)
 		}

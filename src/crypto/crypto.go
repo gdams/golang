@@ -143,7 +143,7 @@ func (h Hash) Available() bool {
 // hash function. This is intended to be called from the init function in
 // packages that implement hash functions.
 func RegisterHash(h Hash, f func() hash.Hash) {
-	if h >= maxHash {
+	if h == 0 || h >= maxHash {
 		panic("crypto: RegisterHash of unknown hash function")
 	}
 	hashes[h] = f
@@ -252,4 +252,22 @@ func SignMessage(signer Signer, rand io.Reader, msg []byte, opts SignerOpts) (si
 		msg = h.Sum(nil)
 	}
 	return signer.Sign(rand, msg, opts)
+}
+
+// Decapsulator is an interface for an opaque private KEM key that can be used for
+// decapsulation operations. For example, an ML-KEM key kept in a hardware module.
+//
+// It is implemented, for example, by [crypto/mlkem.DecapsulationKey768].
+type Decapsulator interface {
+	Encapsulator() Encapsulator
+	Decapsulate(ciphertext []byte) (sharedKey []byte, err error)
+}
+
+// Encapsulator is an interface for a public KEM key that can be used for
+// encapsulation operations.
+//
+// It is implemented, for example, by [crypto/mlkem.EncapsulationKey768].
+type Encapsulator interface {
+	Bytes() []byte
+	Encapsulate() (sharedKey, ciphertext []byte)
 }

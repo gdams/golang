@@ -35,7 +35,7 @@ in the go.mod file.
 
 The -x flag causes graph to print the commands graph executes.
 
-See https://golang.org/ref/mod#go-mod-graph for more about 'go mod graph'.
+See https://go.dev/ref/mod#go-mod-graph for more about 'go mod graph'.
 	`,
 	Run: runGraph,
 }
@@ -52,23 +52,24 @@ func init() {
 }
 
 func runGraph(ctx context.Context, cmd *base.Command, args []string) {
-	modload.InitWorkfile(modload.LoaderState)
+	moduleLoader := modload.NewLoader()
+	moduleLoader.InitWorkfile()
 
 	if len(args) > 0 {
 		base.Fatalf("go: 'go mod graph' accepts no arguments")
 	}
-	modload.LoaderState.ForceUseModules = true
-	modload.LoaderState.RootMode = modload.NeedRoot
+	moduleLoader.ForceUseModules = true
+	moduleLoader.RootMode = modload.NeedRoot
 
 	goVersion := graphGo.String()
 	if goVersion != "" && gover.Compare(gover.Local(), goVersion) < 0 {
-		toolchain.SwitchOrFatal(modload.LoaderState, ctx, &gover.TooNewError{
+		toolchain.SwitchOrFatal(moduleLoader, ctx, &gover.TooNewError{
 			What:      "-go flag",
 			GoVersion: goVersion,
 		})
 	}
 
-	mg, err := modload.LoadModGraph(modload.LoaderState, ctx, goVersion)
+	mg, err := modload.LoadModGraph(moduleLoader, ctx, goVersion)
 	if err != nil {
 		base.Fatal(err)
 	}

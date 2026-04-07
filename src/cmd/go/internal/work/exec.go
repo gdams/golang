@@ -248,6 +248,11 @@ func (b *Builder) Do(ctx context.Context, root *Action) {
 
 	wg.Wait()
 
+	if tokens != totalTokens || concurrentProcesses != 0 {
+		base.Fatalf("internal error: tokens not restored at end of build: tokens: %d, totalTokens: %d, concurrentProcesses: %d",
+			tokens, totalTokens, concurrentProcesses)
+	}
+
 	// Write action graph again, this time with timing information.
 	writeActionGraph()
 }
@@ -622,7 +627,7 @@ func (b *Builder) checkCacheForBuild(a, buildAction *Action, covMetaFileName str
 	// If we are going to do a full build anyway,
 	// we're going to regenerate the files in the build action anyway.
 	if need == needVet {
-		if err := b.loadCachedVet(buildAction); err == nil {
+		if err := b.loadCachedVet(buildAction, a.Deps); err == nil {
 			need &^= needVet
 		}
 	}
@@ -836,7 +841,7 @@ func (b *Builder) build(ctx context.Context, a *Action) (err error) {
 
 	// Prepare Go vet config if needed.
 	if need&needVet != 0 {
-		buildVetConfig(a, srcfiles)
+		buildVetConfig(a, srcfiles, a.Deps)
 		need &^= needVet
 	}
 	if need&needCompiledGoFiles != 0 {
@@ -923,6 +928,12 @@ func (b *Builder) build(ctx context.Context, a *Action) (err error) {
 	// Compile Go.
 	objpkg := objdir + "_pkg_.a"
 	ofile, out, err := BuildToolchain.gc(b, a, objpkg, icfg.Bytes(), embedcfg, symabis, len(sfiles) > 0, pgoProfile, gofiles)
+	if len(out) > 0 && (p.UsesCgo() || p.UsesSwig()) && !cfg.BuildX {
+		// Fix up output referring to cgo-generated code to be more readable.
+		// Replace *[100]_Ctype_foo with *[100]C.foo.
+		// If we're using -x, assume we're debugging and want the full dump, so disable the rewrite.
+		out = cgoTypeSigRe.ReplaceAll(out, []byte("C."))
+	}
 	if err := sh.reportCmd("", "", out, err); err != nil {
 		return err
 	}
@@ -1028,6 +1039,8 @@ func (b *Builder) build(ctx context.Context, a *Action) (err error) {
 	return nil
 }
 
+var cgoTypeSigRe = lazyregexp.New(`\b_C2?(type|func|var|macro)_\B`)
+
 func (b *Builder) checkDirectives(a *Action) error {
 	var msg []byte
 	p := a.Package
@@ -1116,7 +1129,7 @@ func (b *Builder) cacheSrcFiles(a *Action, srcfiles []string) {
 	cache.PutBytes(c, cache.Subkey(a.actionID, "srcfiles"), buf.Bytes())
 }
 
-func (b *Builder) loadCachedVet(a *Action) error {
+func (b *Builder) loadCachedVet(a *Action, vetDeps []*Action) error {
 	c := cache.Default()
 	list, _, err := cache.GetBytes(c, cache.Subkey(a.actionID, "srcfiles"))
 	if err != nil {
@@ -1136,7 +1149,7 @@ func (b *Builder) loadCachedVet(a *Action) error {
 		}
 		srcfiles = append(srcfiles, a.Objdir+name)
 	}
-	buildVetConfig(a, srcfiles)
+	buildVetConfig(a, srcfiles, vetDeps)
 	return nil
 }
 
@@ -1187,11 +1200,12 @@ type vetConfig struct {
 	VetxOutput    string            // write vetx data to this output file
 	Stdout        string            // write stdout (JSON, unified diff) to this output file
 	GoVersion     string            // Go version for package
+	FixArchive    string            // write fixed files to this zip archive, if non-empty
 
 	SucceedOnTypecheckFailure bool // awful hack; see #18395 and below
 }
 
-func buildVetConfig(a *Action, srcfiles []string) {
+func buildVetConfig(a *Action, srcfiles []string, vetDeps []*Action) {
 	// Classify files based on .go extension.
 	// srcfiles does not include raw cgo files.
 	var gofiles, nongofiles []string
@@ -1247,7 +1261,7 @@ func buildVetConfig(a *Action, srcfiles []string) {
 		vcfgMapped[p] = true
 	}
 
-	for _, a1 := range a.Deps {
+	for _, a1 := range vetDeps {
 		p1 := a1.Package
 		if p1 == nil || p1.ImportPath == "" || p1 == a.Package {
 			continue
@@ -1308,6 +1322,9 @@ func (b *Builder) vet(ctx context.Context, a *Action) error {
 	vcfg.VetxOnly = a.VetxOnly
 	vcfg.VetxOutput = a.Objdir + "vet.out"
 	vcfg.Stdout = a.Objdir + "vet.stdout"
+	if a.needFix {
+		vcfg.FixArchive = a.Objdir + "vet.fix.zip"
+	}
 	vcfg.PackageVetx = make(map[string]string)
 
 	h := cache.NewHash("vet " + a.Package.ImportPath)
@@ -1368,31 +1385,60 @@ func (b *Builder) vet(ctx context.Context, a *Action) error {
 			vcfg.PackageVetx[a1.Package.ImportPath] = a1.built
 		}
 	}
-	vetxKey := cache.ActionID(h.Sum()) // for .vetx file
-
-	fmt.Fprintf(h, "stdout\n")
-	stdoutKey := cache.ActionID(h.Sum()) // for .stdout file
+	var (
+		id            = cache.ActionID(h.Sum())     // for .vetx file
+		stdoutKey     = cache.Subkey(id, "stdout")  // for .stdout file
+		fixArchiveKey = cache.Subkey(id, "fix.zip") // for .fix.zip file
+	)
 
 	// Check the cache; -a forces a rebuild.
 	if !cfg.BuildA {
 		c := cache.Default()
-		if vcfg.VetxOnly {
-			if file, _, err := cache.GetFile(c, vetxKey); err == nil {
-				a.built = file
-				return nil
-			}
-		} else {
-			// Copy cached vet.std files to stdout.
-			if file, _, err := cache.GetFile(c, stdoutKey); err == nil {
-				f, err := os.Open(file)
-				if err != nil {
-					return err
-				}
-				defer f.Close() // ignore error (can't fail)
-				return VetHandleStdout(f)
-			}
+
+		// There may be multiple artifacts in the cache.
+		// We need to retrieve them all, or none:
+		// the effect must be transactional.
+		var (
+			vetxFile   string                           // name of cached .vetx file
+			fixArchive string                           // name of cached .fix.zip file
+			stdout     io.Reader = bytes.NewReader(nil) // cached stdout stream
+		)
+
+		// Obtain location of cached .vetx file.
+		vetxFile, _, err := cache.GetFile(c, id)
+		if err != nil {
+			goto cachemiss
 		}
+
+		// Obtain location of cached .fix.zip file (if needed).
+		if a.needFix {
+			file, _, err := cache.GetFile(c, fixArchiveKey)
+			if err != nil {
+				goto cachemiss
+			}
+			fixArchive = file
+		}
+
+		// Copy cached .stdout file to stdout.
+		if file, _, err := cache.GetFile(c, stdoutKey); err == nil {
+			f, err := os.Open(file)
+			if err != nil {
+				goto cachemiss
+			}
+			defer f.Close() // ignore error (can't fail)
+			stdout = f
+		}
+
+		// Cache hit: commit transaction.
+		a.built = vetxFile
+		a.FixArchive = fixArchive
+		if err := VetHandleStdout(stdout); err != nil {
+			return err // internal error (don't fall through to cachemiss)
+		}
+
+		return nil
 	}
+cachemiss:
 
 	js, err := json.MarshalIndent(vcfg, "", "\t")
 	if err != nil {
@@ -1419,13 +1465,23 @@ func (b *Builder) vet(ctx context.Context, a *Action) error {
 		return err
 	}
 
-	// Vet tool succeeded, possibly with facts and JSON stdout. Save both in cache.
+	// Vet tool succeeded, possibly with facts, fixes, or JSON stdout.
+	// Save all in cache.
 
-	// Save facts
+	// Save facts.
 	if f, err := os.Open(vcfg.VetxOutput); err == nil {
 		defer f.Close() // ignore error
 		a.built = vcfg.VetxOutput
-		cache.Default().Put(vetxKey, f) // ignore error
+		cache.Default().Put(id, f) // ignore error
+	}
+
+	// Save fix archive (if any).
+	if a.needFix {
+		if f, err := os.Open(vcfg.FixArchive); err == nil {
+			defer f.Close() // ignore error
+			a.FixArchive = vcfg.FixArchive
+			cache.Default().Put(fixArchiveKey, f) // ignore error
+		}
 	}
 
 	// Save stdout.
@@ -1740,6 +1796,11 @@ func (b *Builder) getPkgConfigFlags(a *Action, p *load.Package) (cflags, ldflags
 				return nil, nil, fmt.Errorf("invalid pkg-config package name: %s", pkg)
 			}
 		}
+
+		if err := checkPkgConfigFlags("", "pkg-config", pcflags); err != nil {
+			return nil, nil, err
+		}
+
 		var out []byte
 		out, err = sh.runOut(p.Dir, nil, b.PkgconfigCmd(), "--cflags", pcflags, "--", pkgs)
 		if err != nil {
@@ -2193,7 +2254,7 @@ func (noToolchain) cc(b *Builder, a *Action, ofile, cfile string) error {
 // gcc runs the gcc C compiler to create an object from a single C file.
 func (b *Builder) gcc(a *Action, workdir, out string, flags []string, cfile string) error {
 	p := a.Package
-	return b.ccompile(modload.LoaderState, a, out, flags, cfile, b.GccCmd(p.Dir, workdir))
+	return b.ccompile(a, out, flags, cfile, b.GccCmd(p.Dir, workdir))
 }
 
 // gas runs the gcc c compiler to create an object file from a single C assembly file.
@@ -2207,23 +2268,23 @@ func (b *Builder) gas(a *Action, workdir, out string, flags []string, sfile stri
 			return fmt.Errorf("package using cgo has Go assembly file %s", sfile)
 		}
 	}
-	return b.ccompile(modload.LoaderState, a, out, flags, sfile, b.GccCmd(p.Dir, workdir))
+	return b.ccompile(a, out, flags, sfile, b.GccCmd(p.Dir, workdir))
 }
 
 // gxx runs the g++ C++ compiler to create an object from a single C++ file.
 func (b *Builder) gxx(a *Action, workdir, out string, flags []string, cxxfile string) error {
 	p := a.Package
-	return b.ccompile(modload.LoaderState, a, out, flags, cxxfile, b.GxxCmd(p.Dir, workdir))
+	return b.ccompile(a, out, flags, cxxfile, b.GxxCmd(p.Dir, workdir))
 }
 
 // gfortran runs the gfortran Fortran compiler to create an object from a single Fortran file.
 func (b *Builder) gfortran(a *Action, workdir, out string, flags []string, ffile string) error {
 	p := a.Package
-	return b.ccompile(modload.LoaderState, a, out, flags, ffile, b.gfortranCmd(p.Dir, workdir))
+	return b.ccompile(a, out, flags, ffile, b.gfortranCmd(p.Dir, workdir))
 }
 
 // ccompile runs the given C or C++ compiler and creates an object from a single source file.
-func (b *Builder) ccompile(loaderstate *modload.State, a *Action, outfile string, flags []string, file string, compiler []string) error {
+func (b *Builder) ccompile(a *Action, outfile string, flags []string, file string, compiler []string) error {
 	p := a.Package
 	sh := b.Shell(a)
 	file = mkAbs(p.Dir, file)
@@ -2260,7 +2321,7 @@ func (b *Builder) ccompile(loaderstate *modload.State, a *Action, outfile string
 			} else if m.Dir == "" {
 				// The module is in the vendor directory. Replace the entire vendor
 				// directory path, because the module's Dir is not filled in.
-				from = modload.VendorDir(loaderstate)
+				from = b.getVendorDir()
 				toPath = "vendor"
 			} else {
 				from = m.Dir
@@ -2310,7 +2371,7 @@ func (b *Builder) ccompile(loaderstate *modload.State, a *Action, outfile string
 			}
 		}
 		if len(newFlags) < len(flags) {
-			return b.ccompile(loaderstate, a, outfile, newFlags, file, compiler)
+			return b.ccompile(a, outfile, newFlags, file, compiler)
 		}
 	}
 
@@ -3270,7 +3331,7 @@ func (b *Builder) swig(a *Action, objdir string, pcCFLAGS []string) error {
 		}
 	}
 	for _, f := range p.SwigCXXFiles {
-		if b.swigOne(a, f, objdir, pcCFLAGS, true, intgosize); err != nil {
+		if err := b.swigOne(a, f, objdir, pcCFLAGS, true, intgosize); err != nil {
 			return err
 		}
 	}
@@ -3383,7 +3444,7 @@ func (b *Builder) swigDoIntSize(objdir string) (intsize string, err error) {
 	}
 	srcs := []string{src}
 
-	p := load.GoFilesPackage(modload.LoaderState, context.TODO(), load.PackageOpts{}, srcs)
+	p := load.GoFilesPackage(modload.NewLoader(), context.TODO(), load.PackageOpts{}, srcs)
 
 	if _, _, e := BuildToolchain.gc(b, &Action{Mode: "swigDoIntSize", Package: p, Objdir: objdir}, "", nil, nil, "", false, "", srcs); e != nil {
 		return "32", nil
@@ -3588,7 +3649,7 @@ func useResponseFile(path string, argLen int) bool {
 	// TODO: Note that other toolchains like CC are missing here for now.
 	prog := strings.TrimSuffix(filepath.Base(path), ".exe")
 	switch prog {
-	case "compile", "link", "cgo", "asm", "cover":
+	case "compile", "link", "cgo", "asm", "cover", "pack":
 	default:
 		return false
 	}
@@ -3607,24 +3668,35 @@ func useResponseFile(path string, argLen int) bool {
 	return false
 }
 
-// encodeArg encodes an argument for response file writing.
+// encodeArg encodes an argument for response file writing using GCC-compatible format.
+// Arguments containing special characters are wrapped in double quotes with escapes.
 func encodeArg(arg string) string {
-	// If there aren't any characters we need to reencode, fastpath out.
-	if !strings.ContainsAny(arg, "\\\n") {
+	// Empty string must be quoted to preserve it.
+	if arg == "" {
+		return `""`
+	}
+	// If no special characters, return as-is.
+	if !strings.ContainsAny(arg, " \t\n\r'\"\\$`") {
 		return arg
 	}
+
+	// Use double quotes and escape special chars.
 	var b strings.Builder
+	b.WriteByte('"')
 	for _, r := range arg {
 		switch r {
 		case '\\':
-			b.WriteByte('\\')
-			b.WriteByte('\\')
-		case '\n':
-			b.WriteByte('\\')
-			b.WriteByte('n')
+			b.WriteString(`\\`)
+		case '"':
+			b.WriteString(`\"`)
+		case '$':
+			b.WriteString(`\$`)
+		case '`':
+			b.WriteString("\\`")
 		default:
 			b.WriteRune(r)
 		}
 	}
+	b.WriteByte('"')
 	return b.String()
 }

@@ -42,9 +42,12 @@ thing that go work use does.
 
 The -r flag searches recursively for modules in the argument
 directories, and the use command operates as if each of the directories
-were specified as arguments.
+were specified as arguments. When -r is used, symlinks to directories
+within the argument tree are ignored.
 
-
+The go command matches use paths to module directories without resolving
+symbolic links. A use directive that names a symlink to a directory is
+not interchangeable with one that names the symlink's target.
 
 See the workspaces reference at https://go.dev/ref/mod#workspaces
 for more information.
@@ -61,9 +64,10 @@ func init() {
 }
 
 func runUse(ctx context.Context, cmd *base.Command, args []string) {
-	modload.LoaderState.ForceUseModules = true
-	modload.InitWorkfile(modload.LoaderState)
-	gowork := modload.WorkFilePath(modload.LoaderState)
+	moduleLoader := modload.NewLoader()
+	moduleLoader.ForceUseModules = true
+	moduleLoader.InitWorkfile()
+	gowork := modload.WorkFilePath(moduleLoader)
 	if gowork == "" {
 		base.Fatalf("go: no go.work file found\n\t(run 'go work init' first or specify path using GOWORK environment variable)")
 	}
@@ -71,11 +75,11 @@ func runUse(ctx context.Context, cmd *base.Command, args []string) {
 	if err != nil {
 		base.Fatal(err)
 	}
-	workUse(ctx, gowork, wf, args)
+	workUse(ctx, moduleLoader, gowork, wf, args)
 	modload.WriteWorkFile(gowork, wf)
 }
 
-func workUse(ctx context.Context, gowork string, wf *modfile.WorkFile, args []string) {
+func workUse(ctx context.Context, s *modload.Loader, gowork string, wf *modfile.WorkFile, args []string) {
 	workDir := filepath.Dir(gowork) // absolute, since gowork itself is absolute
 
 	haveDirs := make(map[string][]string) // absolute → original(s)
@@ -94,7 +98,7 @@ func workUse(ctx context.Context, gowork string, wf *modfile.WorkFile, args []st
 	// all entries for the absolute path should be removed.
 	keepDirs := make(map[string]string)
 
-	sw := toolchain.NewSwitcher(modload.LoaderState)
+	sw := toolchain.NewSwitcher(s)
 
 	// lookDir updates the entry in keepDirs for the directory dir,
 	// which is either absolute or relative to the current working directory
@@ -161,6 +165,9 @@ func workUse(ctx context.Context, gowork string, wf *modfile.WorkFile, args []st
 					}
 				}
 				return nil
+			}
+			if d.Name() == "vendor" {
+				return filepath.SkipDir
 			}
 			lookDir(path)
 			return nil

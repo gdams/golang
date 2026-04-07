@@ -486,7 +486,7 @@ func semacreate(mp *m) {
 func semasleep(ns int64) int {
 	gp := getg()
 	if ns >= 0 {
-		ms := timediv(ns, 1000000, nil)
+		ms := int32(ns / 1000000)
 		if ms == 0 {
 			ms = 1
 		}
@@ -593,4 +593,14 @@ func walltime() (sec int64, nsec int32) {
 	var t [1]uint64
 	readtime(&t[0], 1, 1)
 	return timesplit(frombe(t[0]))
+}
+
+//go:nowritebarrierrec
+//go:nosplit
+func libpreinit() {}
+
+//go:nowritebarrierrec
+//go:nosplit
+func newosproc0(stacksize uintptr, fn unsafe.Pointer) {
+	throw("bad newosproc0")
 }

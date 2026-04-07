@@ -354,7 +354,6 @@ func main() {
 		},
 	}
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			tempDir := t.TempDir()
@@ -387,7 +386,7 @@ func TestRISCVTrampolines(t *testing.T) {
 	buf := new(bytes.Buffer)
 	fmt.Fprintf(buf, "TEXT a(SB),$0-0\n")
 	for i := 0; i < 1<<17; i++ {
-		fmt.Fprintf(buf, "\tADD $0, X0, X0\n")
+		fmt.Fprintf(buf, "\tADD $0, X5, X0\n")
 	}
 	fmt.Fprintf(buf, "\tCALL b(SB)\n")
 	fmt.Fprintf(buf, "\tRET\n")
@@ -398,7 +397,7 @@ func TestRISCVTrampolines(t *testing.T) {
 	fmt.Fprintf(buf, "\tRET\n")
 	fmt.Fprintf(buf, "TEXT ·d(SB),0,$0-0\n")
 	for i := 0; i < 1<<17; i++ {
-		fmt.Fprintf(buf, "\tADD $0, X0, X0\n")
+		fmt.Fprintf(buf, "\tADD $0, X5, X0\n")
 	}
 	fmt.Fprintf(buf, "\tCALL a(SB)\n")
 	fmt.Fprintf(buf, "\tCALL c(SB)\n")

@@ -16,7 +16,6 @@ import (
 	"errors"
 	"internal/bytealg"
 	"internal/byteorder"
-	"internal/itoa"
 	"math"
 	"strconv"
 	"unique"
@@ -638,6 +637,9 @@ func (ip Addr) IsGlobalUnicast() bool {
 // (IPv4 addresses) and RFC 4193 (IPv6 addresses). That is, it reports whether
 // ip is in 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, or fc00::/7. This is the
 // same as [net.IP.IsPrivate].
+//
+// IsPrivate does not describe a security property of addresses,
+// and should not be used for access control.
 func (ip Addr) IsPrivate() bool {
 	if ip.Is4In6() {
 		ip = ip.Unmap()
@@ -684,12 +686,12 @@ func (ip Addr) Prefix(b int) (Prefix, error) {
 		return Prefix{}, nil
 	case z4:
 		if b > 32 {
-			return Prefix{}, errors.New("prefix length " + itoa.Itoa(b) + " too large for IPv4")
+			return Prefix{}, errors.New("prefix length " + strconv.Itoa(b) + " too large for IPv4")
 		}
 		effectiveBits += 96
 	default:
 		if b > 128 {
-			return Prefix{}, errors.New("prefix length " + itoa.Itoa(b) + " too large for IPv6")
+			return Prefix{}, errors.New("prefix length " + strconv.Itoa(b) + " too large for IPv6")
 		}
 	}
 	ip.addr = ip.addr.and(mask6(effectiveBits))
@@ -1593,5 +1595,23 @@ func (p Prefix) String() string {
 	if !p.IsValid() {
 		return "invalid Prefix"
 	}
-	return p.ip.String() + "/" + itoa.Itoa(p.Bits())
+	var b []byte
+	switch {
+	case p.ip.z == z4:
+		const maxCap = len("255.255.255.255/32")
+		b = make([]byte, 0, maxCap)
+		b = p.ip.appendTo4(b)
+	case p.ip.Is4In6():
+		const maxCap = len("::ffff:255.255.255.255/32")
+		b = make([]byte, 0, maxCap)
+		b = append(b, "::ffff:"...)
+		b = p.ip.Unmap().appendTo4(b)
+	default:
+		const maxCap = len("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff/128")
+		b = make([]byte, 0, maxCap)
+		b = p.ip.appendTo6(b)
+	}
+	b = append(b, '/')
+	b = appendDecimal(b, uint8(p.Bits()))
+	return string(b)
 }

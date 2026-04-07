@@ -36,48 +36,17 @@ TEXT _rt0_386_lib(SB),NOSPLIT,$0
 	MOVL	12(BP), AX
 	MOVL	AX, _rt0_386_lib_argv<>(SB)
 
-	// Synchronous initialization.
-	CALL	runtime·libpreinit(SB)
+	CALL	runtime·libInit(SB)
 
-	SUBL	$8, SP
-
-	// Create a new thread to do the runtime initialization.
-	MOVL	_cgo_sys_thread_create(SB), AX
-	TESTL	AX, AX
-	JZ	nocgo
-
-	// Align stack to call C function.
-	// We moved SP to BP above, but BP was clobbered by the libpreinit call.
-	MOVL	SP, BP
-	ANDL	$~15, SP
-
-	MOVL	$_rt0_386_lib_go(SB), BX
-	MOVL	BX, 0(SP)
-	MOVL	$0, 4(SP)
-
-	CALL	AX
-
-	MOVL	BP, SP
-
-	JMP	restore
-
-nocgo:
-	MOVL	$0x800000, 0(SP)                    // stacksize = 8192KB
-	MOVL	$_rt0_386_lib_go(SB), AX
-	MOVL	AX, 4(SP)                           // fn
-	CALL	runtime·newosproc0(SB)
-
-restore:
-	ADDL	$8, SP
 	POPL	DI
 	POPL	SI
 	POPL	BX
 	POPL	BP
 	RET
 
-// _rt0_386_lib_go initializes the Go runtime.
+// rt0_lib_go initializes the Go runtime.
 // This is started in a separate thread by _rt0_386_lib.
-TEXT _rt0_386_lib_go(SB),NOSPLIT,$8
+TEXT runtime·rt0_lib_go<ABIInternal>(SB),NOSPLIT,$8
 	MOVL	_rt0_386_lib_argc<>(SB), AX
 	MOVL	AX, 0(SP)
 	MOVL	_rt0_386_lib_argv<>(SB), AX
@@ -665,6 +634,13 @@ TEXT ·asmcgocall(SB),NOSPLIT,$0-12
 	// We get called to create new OS threads too, and those
 	// come in on the m->g0 stack already. Or we might already
 	// be on the m->gsignal stack.
+#ifdef GOOS_windows
+	// On Windows, get_tls might return garbage if the thread
+	// has never called into Go, so check tls_g directly.
+	MOVL	runtime·tls_g(SB), CX
+	CMPL	CX, $0
+	JEQ	nosave
+#endif
 	get_tls(CX)
 	MOVL	g(CX), DI
 	CMPL	DI, $0
@@ -741,7 +717,7 @@ loadg:
 #ifdef GOOS_windows
 	MOVL	$0, BP
 	CMPL	CX, $0
-	JEQ	2(PC) // TODO
+	JEQ	needm
 #endif
 	MOVL	g(CX), BP
 	CMPL	BP, $0
@@ -954,7 +930,7 @@ TEXT runtime·memhash(SB),NOSPLIT,$0-16
 	MOVL	p+0(FP), AX	// ptr to data
 	MOVL	s+8(FP), BX	// size
 	LEAL	ret+12(FP), DX
-	JMP	aeshashbody<>(SB)
+	JMP	runtime·aeshashbody<>(SB)
 noaes:
 	JMP	runtime·memhashFallback(SB)
 
@@ -965,14 +941,14 @@ TEXT runtime·strhash(SB),NOSPLIT,$0-12
 	MOVL	4(AX), BX	// length of string
 	MOVL	(AX), AX	// string data
 	LEAL	ret+8(FP), DX
-	JMP	aeshashbody<>(SB)
+	JMP	runtime·aeshashbody<>(SB)
 noaes:
 	JMP	runtime·strhashFallback(SB)
 
 // AX: data
 // BX: length
 // DX: address to put return value
-TEXT aeshashbody<>(SB),NOSPLIT,$0-0
+TEXT runtime·aeshashbody<>(SB),NOSPLIT,$0-0
 	MOVL	h+4(FP), X0	            // 32 bits of per-table hash seed
 	PINSRW	$4, BX, X0	            // 16 bits of length
 	PSHUFHW	$0, X0, X0	            // replace size with its low 2 bytes repeated 4 times

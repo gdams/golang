@@ -189,16 +189,16 @@ func findEnv(env []cfg.EnvVar, name string) string {
 }
 
 // ExtraEnvVars returns environment variables that should not leak into child processes.
-func ExtraEnvVars(loaderstate *modload.State) []cfg.EnvVar {
+func ExtraEnvVars(ld *modload.Loader) []cfg.EnvVar {
 	gomod := ""
-	modload.Init(loaderstate)
-	if modload.HasModRoot(loaderstate) {
-		gomod = modload.ModFilePath(loaderstate)
-	} else if modload.Enabled(loaderstate) {
+	modload.Init(ld)
+	if ld.HasModRoot() {
+		gomod = ld.ModFilePath()
+	} else if ld.Enabled() {
 		gomod = os.DevNull
 	}
-	modload.InitWorkfile(loaderstate)
-	gowork := modload.WorkFilePath(loaderstate)
+	ld.InitWorkfile()
+	gowork := modload.WorkFilePath(ld)
 	// As a special case, if a user set off explicitly, report that in GOWORK.
 	if cfg.Getenv("GOWORK") == "off" {
 		gowork = "off"
@@ -211,8 +211,8 @@ func ExtraEnvVars(loaderstate *modload.State) []cfg.EnvVar {
 
 // ExtraEnvVarsCostly returns environment variables that should not leak into child processes
 // but are costly to evaluate.
-func ExtraEnvVarsCostly() []cfg.EnvVar {
-	b := work.NewBuilder("")
+func ExtraEnvVarsCostly(ld *modload.Loader) []cfg.EnvVar {
+	b := work.NewBuilder("", ld.VendorDirOrEmpty)
 	defer func() {
 		if err := b.Close(); err != nil {
 			base.Fatal(err)
@@ -272,6 +272,7 @@ func argKey(arg string) string {
 }
 
 func runEnv(ctx context.Context, cmd *base.Command, args []string) {
+	moduleLoader := modload.NewLoader()
 	if *envJson && *envU {
 		base.Fatalf("go: cannot use -json with -u")
 	}
@@ -306,7 +307,7 @@ func runEnv(ctx context.Context, cmd *base.Command, args []string) {
 	}
 
 	env := cfg.CmdEnv
-	env = append(env, ExtraEnvVars(modload.LoaderState)...)
+	env = append(env, ExtraEnvVars(moduleLoader)...)
 
 	if err := fsys.Init(); err != nil {
 		base.Fatal(err)
@@ -336,8 +337,8 @@ func runEnv(ctx context.Context, cmd *base.Command, args []string) {
 		}
 	}
 	if needCostly {
-		work.BuildInit(modload.LoaderState)
-		env = append(env, ExtraEnvVarsCostly()...)
+		work.BuildInit(moduleLoader)
+		env = append(env, ExtraEnvVarsCostly(moduleLoader)...)
 	}
 
 	if len(args) > 0 {
@@ -603,7 +604,17 @@ func getOrigEnv(key string) string {
 
 func checkEnvWrite(key, val string) error {
 	switch key {
-	case "GOEXE", "GOGCCFLAGS", "GOHOSTARCH", "GOHOSTOS", "GOMOD", "GOWORK", "GOTOOLDIR", "GOVERSION", "GOTELEMETRY", "GOTELEMETRYDIR":
+	case "GOEXE",
+		"GOGCCFLAGS",
+		"GOHOSTARCH",
+		"GOHOSTOS",
+		"GOMOD",
+		"GOROOT",
+		"GOTELEMETRY",
+		"GOTELEMETRYDIR",
+		"GOTOOLDIR",
+		"GOVERSION",
+		"GOWORK":
 		return fmt.Errorf("%s cannot be modified", key)
 	case "GOENV", "GODEBUG":
 		return fmt.Errorf("%s can only be set using the OS environment", key)

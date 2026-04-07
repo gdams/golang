@@ -167,7 +167,7 @@ func ssaGenValue(s *ssagen.State, v *ssa.Value) {
 		ssa.Op386SBBL:
 		opregreg(s, v.Op.Asm(), v.Reg(), v.Args[1].Reg())
 
-	case ssa.Op386ADDLcarry, ssa.Op386SUBLcarry:
+	case ssa.Op386ADDLcarry, ssa.Op386ADCLcarry, ssa.Op386SUBLcarry:
 		// output 0 is carry/borrow, output 1 is the low 32 bits.
 		opregreg(s, v.Op.Asm(), v.Reg0(), v.Args[1].Reg())
 
@@ -903,7 +903,7 @@ func ssaGenValue(s *ssagen.State, v *ssa.Value) {
 
 	case ssa.Op386CALLstatic, ssa.Op386CALLclosure, ssa.Op386CALLinter:
 		s.Call(v)
-	case ssa.Op386CALLtail:
+	case ssa.Op386CALLtail, ssa.Op386CALLtailinter:
 		s.TailCall(v)
 	case ssa.Op386NEGL,
 		ssa.Op386BSWAPL,

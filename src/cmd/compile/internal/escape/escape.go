@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"go/constant"
 	"go/token"
+	"internal/goexperiment"
 
 	"cmd/compile/internal/base"
 	"cmd/compile/internal/ir"
@@ -367,6 +368,21 @@ func (b *batch) finish(fns []*ir.Func) {
 				}
 				n.SetOp(ir.OSTR2BYTESTMP)
 			}
+		}
+	}
+
+	if goexperiment.RuntimeFreegc {
+		// Look for specific patterns of usage, such as appends
+		// to slices that we can prove are not aliased.
+		for _, fn := range fns {
+			a := aliasAnalysis{}
+			a.analyze(fn)
+		}
+	}
+
+	for _, fn := range fns {
+		if ir.MatchAstDump(fn, "escape") {
+			ir.AstDump(fn, "escape, "+ir.FuncName(fn))
 		}
 	}
 }

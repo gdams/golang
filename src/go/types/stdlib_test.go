@@ -330,12 +330,9 @@ func TestStdFixed(t *testing.T) {
 		"issue48230.go",  // go/types doesn't check validity of //go:xxx directives
 		"issue49767.go",  // go/types does not have constraints on channel element size
 		"issue49814.go",  // go/types does not have constraints on array size
+		"issue78355.go",  // go/types does not have constraints on map element size
 		"issue56103.go",  // anonymous interface cycles; will be a type checker error in 1.22
 		"issue52697.go",  // go/types does not have constraints on stack size
-		"issue68054.go",  // this test requires GODEBUG=gotypesalias=1
-		"issue68580.go",  // this test requires GODEBUG=gotypesalias=1
-		"issue73309.go",  // this test requires GODEBUG=gotypesalias=1
-		"issue73309b.go", // this test requires GODEBUG=gotypesalias=1
 
 		// These tests requires runtime/cgo.Incomplete, which is only available on some platforms.
 		// However, go/types does not know about build constraints.
@@ -361,6 +358,8 @@ var excluded = map[string]bool{
 	"builtin":                       true,
 	"cmd/compile/internal/ssa/_gen": true,
 	"runtime/_mkmalloc":             true,
+	"simd/archsimd/_gen/simdgen":    true,
+	"simd/archsimd/_gen/unify":      true,
 }
 
 // printPackageMu synchronizes the printing of type-checked package files in

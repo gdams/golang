@@ -29,7 +29,8 @@ import (
 // The name of an unknown JSON object member can be extracted as:
 //
 //	err := ...
-//	if serr, ok := errors.AsType[json.SemanticError](err); ok && serr.Err == json.ErrUnknownName {
+//	serr, ok := errors.AsType[*json.SemanticError](err)
+//	if ok && serr.Err == json.ErrUnknownName {
 //		ptr := serr.JSONPointer // JSON pointer to unknown name
 //		name := ptr.LastToken() // unknown name itself
 //		...
@@ -164,7 +165,7 @@ func newUnmarshalErrorAfter(d *jsontext.Decoder, t reflect.Type, err error) erro
 		JSONKind:    jsontext.Value(tokOrVal).Kind()}
 }
 
-// newUnmarshalErrorAfter wraps err in a SemanticError assuming that d
+// newUnmarshalErrorAfterWithValue wraps err in a SemanticError assuming that d
 // is positioned right after the previous token or value, which caused an error.
 // It also stores a copy of the last JSON value if it is a string or number.
 func newUnmarshalErrorAfterWithValue(d *jsontext.Decoder, t reflect.Type, err error) error {
@@ -294,6 +295,13 @@ func collapseSemanticErrors(err error) error {
 			serr2.JSONPointer = serr1.JSONPointer + serr2.JSONPointer
 			*serr1 = *serr2
 		}
+	}
+	return err
+}
+
+func wrapErrUnsupported(err error, what string) error {
+	if errors.Is(err, errors.ErrUnsupported) {
+		return errors.New(what + " may not return errors.ErrUnsupported")
 	}
 	return err
 }

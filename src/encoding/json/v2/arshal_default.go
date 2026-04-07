@@ -843,7 +843,7 @@ func makeMapArshaler(t reflect.Type) *arshaler {
 					k.SetIterKey(iter)
 					(*names)[i] = k.String()
 				}
-				names.Sort()
+				slices.Sort(*names)
 				for _, name := range *names {
 					if err := enc.WriteToken(jsontext.String(name)); err != nil {
 						return err
@@ -1198,7 +1198,7 @@ func makeStructArshaler(t reflect.Type) *arshaler {
 			}
 			prevIdx = f.id
 		}
-		if fields.inlinedFallback != nil && !(mo.Flags.Get(jsonflags.DiscardUnknownMembers) && fields.inlinedFallback.unknown) {
+		if fields.inlinedFallback != nil {
 			var insertUnquotedName func([]byte) bool
 			if !mo.Flags.Get(jsonflags.AllowDuplicateNames) {
 				insertUnquotedName = func(name []byte) bool {
@@ -1270,7 +1270,7 @@ func makeStructArshaler(t reflect.Type) *arshaler {
 						}
 					}
 					if f == nil {
-						if uo.Flags.Get(jsonflags.RejectUnknownMembers) && (fields.inlinedFallback == nil || fields.inlinedFallback.unknown) {
+						if uo.Flags.Get(jsonflags.RejectUnknownMembers) && fields.inlinedFallback == nil {
 							err := newUnmarshalErrorAfter(dec, t, ErrUnknownName)
 							if !uo.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
 								return err

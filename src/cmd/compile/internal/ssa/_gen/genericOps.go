@@ -16,6 +16,9 @@ package main
 // are signed or unsigned.
 
 var genericOps = []opData{
+	// Pseudo-op.
+	{name: "Last", argLength: -1}, // return last element of tuple; for "let" bindings
+
 	// 2-input arithmetic
 	// Types must be consistent with Go typing. Add, for example, must take two values
 	// of the same type and produces that same type.
@@ -372,6 +375,18 @@ var genericOps = []opData{
 	{name: "Load", argLength: 2},                          // Load from arg0.  arg1=memory
 	{name: "Dereference", argLength: 2},                   // Load from arg0.  arg1=memory.  Helper op for arg/result passing, result is an otherwise not-SSA-able "value".
 	{name: "Store", argLength: 3, typ: "Mem", aux: "Typ"}, // Store arg1 to arg0.  arg2=memory, aux=type.  Returns memory.
+
+	// masked memory operations.
+	// TODO add 16 and 8
+	{name: "LoadMasked8", argLength: 3},                           // Load from arg0, arg1 = mask of 8-bits, arg2 = memory
+	{name: "LoadMasked16", argLength: 3},                          // Load from arg0, arg1 = mask of 16-bits, arg2 = memory
+	{name: "LoadMasked32", argLength: 3},                          // Load from arg0, arg1 = mask of 32-bits, arg2 = memory
+	{name: "LoadMasked64", argLength: 3},                          // Load from arg0, arg1 = mask of 64-bits, arg2 = memory
+	{name: "StoreMasked8", argLength: 4, typ: "Mem", aux: "Typ"},  // Store arg2 to arg0, arg1=mask of 8-bits, arg3 = memory
+	{name: "StoreMasked16", argLength: 4, typ: "Mem", aux: "Typ"}, // Store arg2 to arg0, arg1=mask of 16-bits, arg3 = memory
+	{name: "StoreMasked32", argLength: 4, typ: "Mem", aux: "Typ"}, // Store arg2 to arg0, arg1=mask of 32-bits, arg3 = memory
+	{name: "StoreMasked64", argLength: 4, typ: "Mem", aux: "Typ"}, // Store arg2 to arg0, arg1=mask of 64-bits, arg3 = memory
+
 	// Normally we require that the source and destination of Move do not overlap.
 	// There is an exception when we know all the loads will happen before all
 	// the stores. In that case, overlap is ok. See
@@ -434,15 +449,17 @@ var genericOps = []opData{
 	//
 	// Subsequent architecture-specific lowering only changes the opcode.
 
-	{name: "ClosureCall", argLength: -1, aux: "CallOff", call: true}, // arg0=code pointer, arg1=context ptr, arg2..argN-1 are register inputs, argN=memory.  auxint=arg size.  Returns Result of register results, plus memory.
-	{name: "StaticCall", argLength: -1, aux: "CallOff", call: true},  // call function aux.(*obj.LSym), arg0..argN-1 are register inputs, argN=memory.  auxint=arg size.  Returns Result of register results, plus memory.
-	{name: "InterCall", argLength: -1, aux: "CallOff", call: true},   // interface call.  arg0=code pointer, arg1..argN-1 are register inputs, argN=memory, auxint=arg size.  Returns Result of register results, plus memory.
-	{name: "TailCall", argLength: -1, aux: "CallOff", call: true},    // tail call function aux.(*obj.LSym), arg0..argN-1 are register inputs, argN=memory.  auxint=arg size.  Returns Result of register results, plus memory.
+	{name: "ClosureCall", argLength: -1, aux: "CallOff", call: true},   // arg0=code pointer, arg1=context ptr, arg2..argN-1 are register inputs, argN=memory.  auxint=arg size.  Returns Result of register results, plus memory.
+	{name: "StaticCall", argLength: -1, aux: "CallOff", call: true},    // call function aux.(*obj.LSym), arg0..argN-1 are register inputs, argN=memory.  auxint=arg size.  Returns Result of register results, plus memory.
+	{name: "InterCall", argLength: -1, aux: "CallOff", call: true},     // interface call.  arg0=code pointer, arg1..argN-1 are register inputs, argN=memory, auxint=arg size.  Returns Result of register results, plus memory.
+	{name: "TailCall", argLength: -1, aux: "CallOff", call: true},      // tail call function aux.(*obj.LSym), arg0..argN-1 are register inputs, argN=memory.  auxint=arg size.  Returns Result of register results, plus memory.
+	{name: "TailCallInter", argLength: -1, aux: "CallOff", call: true}, // tail call function arg0=code pointer, arg1..argN-1 are register inputs, argN=memory.  auxint=arg size.  Returns Result of register results, plus memory.
 
-	{name: "ClosureLECall", argLength: -1, aux: "CallOff", call: true}, // late-expanded closure call. arg0=code pointer, arg1=context ptr,  arg2..argN-1 are inputs, argN is mem. auxint = arg size. Result is tuple of result(s), plus mem.
-	{name: "StaticLECall", argLength: -1, aux: "CallOff", call: true},  // late-expanded static call function aux.(*ssa.AuxCall.Fn). arg0..argN-1 are inputs, argN is mem. auxint = arg size. Result is tuple of result(s), plus mem.
-	{name: "InterLECall", argLength: -1, aux: "CallOff", call: true},   // late-expanded interface call. arg0=code pointer, arg1..argN-1 are inputs, argN is mem. auxint = arg size. Result is tuple of result(s), plus mem.
-	{name: "TailLECall", argLength: -1, aux: "CallOff", call: true},    // late-expanded static tail call function aux.(*ssa.AuxCall.Fn). arg0..argN-1 are inputs, argN is mem. auxint = arg size. Result is tuple of result(s), plus mem.
+	{name: "ClosureLECall", argLength: -1, aux: "CallOff", call: true},   // late-expanded closure call. arg0=code pointer, arg1=context ptr,  arg2..argN-1 are inputs, argN is mem. auxint = arg size. Result is tuple of result(s), plus mem.
+	{name: "StaticLECall", argLength: -1, aux: "CallOff", call: true},    // late-expanded static call function aux.(*ssa.AuxCall.Fn). arg0..argN-1 are inputs, argN is mem. auxint = arg size. Result is tuple of result(s), plus mem.
+	{name: "InterLECall", argLength: -1, aux: "CallOff", call: true},     // late-expanded interface call. arg0=code pointer, arg1..argN-1 are inputs, argN is mem. auxint = arg size. Result is tuple of result(s), plus mem.
+	{name: "TailLECall", argLength: -1, aux: "CallOff", call: true},      // late-expanded static tail call function aux.(*ssa.AuxCall.Fn). arg0..argN-1 are inputs, argN is mem. auxint = arg size. Result is tuple of result(s), plus mem.
+	{name: "TailLECallInter", argLength: -1, aux: "CallOff", call: true}, // late-expanded static tail call function arg0=code pointer, arg1..argN-1 are inputs, argN is mem. auxint = arg size. Result is tuple of result(s), plus mem.
 
 	// Conversions: signed extensions, zero (unsigned) extensions, truncations
 	{name: "SignExt8to16", argLength: 1, typ: "Int16"},
@@ -522,12 +539,11 @@ var genericOps = []opData{
 	{name: "IData", argLength: 1},                // arg0=interface, returns data field
 
 	// Structs
-	{name: "StructMake", argLength: -1},                // args...=field0..n-1. Returns struct with n fields.
+	{name: "StructMake", argLength: -1},                // args...=field0..n-1. Returns struct with n fields. Must have >0 size (use Empty otherwise).
 	{name: "StructSelect", argLength: 1, aux: "Int64"}, // arg0=struct, auxint=field index.  Returns the auxint'th field.
 
 	// Arrays
-	{name: "ArrayMake0"},                              // Returns array with 0 elements
-	{name: "ArrayMake1", argLength: 1},                // Returns array with 1 element
+	{name: "ArrayMake1", argLength: 1},                // Returns array with 1 element. Use Empty if the element is zero-sized.
 	{name: "ArraySelect", argLength: 1, aux: "Int64"}, // arg0=array, auxint=index. Returns a[i].
 
 	// Spill&restore ops for the register allocator. These are
@@ -557,8 +573,9 @@ var genericOps = []opData{
 	{name: "Int64Hi", argLength: 1, typ: "UInt32"},   // high 32-bit of arg0
 	{name: "Int64Lo", argLength: 1, typ: "UInt32"},   // low 32-bit of arg0
 
-	{name: "Add32carry", argLength: 2, commutative: true, typ: "(UInt32,Flags)"}, // arg0 + arg1, returns (value, carry)
-	{name: "Add32withcarry", argLength: 3, commutative: true},                    // arg0 + arg1 + arg2, arg2=carry (0 or 1)
+	{name: "Add32carry", argLength: 2, commutative: true, typ: "(UInt32,Flags)"},          // arg0 + arg1, returns (value, carry)
+	{name: "Add32withcarry", argLength: 3, commutative: true},                             // arg0 + arg1 + arg2, arg2=carry (0 or 1)
+	{name: "Add32carrywithcarry", argLength: 3, commutative: true, typ: "(UInt32,Flags)"}, // arg0 + arg1 + arg2, arg2=carry, returns (value, carry)
 
 	{name: "Sub32carry", argLength: 2, typ: "(UInt32,Flags)"}, // arg0 - arg1, returns (value, carry)
 	{name: "Sub32withcarry", argLength: 3},                    // arg0 - arg1 - arg2, arg2=carry (0 or 1)
@@ -662,6 +679,54 @@ var genericOps = []opData{
 	// Prefetch instruction
 	{name: "PrefetchCache", argLength: 2, hasSideEffects: true},         // Do prefetch arg0 to cache. arg0=addr, arg1=memory.
 	{name: "PrefetchCacheStreamed", argLength: 2, hasSideEffects: true}, // Do non-temporal or streamed prefetch arg0 to cache. arg0=addr, arg1=memory.
+
+	// Helper instruction which is semantically equivalent to calling runtime.memequal, but some targets may prefer to custom lower it later, e.g. for specific constant sizes.
+	{name: "MemEq", argLength: 4, commutative: true, typ: "Bool"}, // arg0=ptr0, arg1=ptr1, arg2=size, arg3=memory.
+
+	// Value of a zero-sized type.
+	{name: "Empty", argLength: 0},
+
+	// SIMD
+	{name: "ZeroSIMD", argLength: 0}, // zero value of a vector
+
+	// Convert integers to masks
+	{name: "Cvt16toMask8x16", argLength: 1},  // arg0 = integer mask value
+	{name: "Cvt32toMask8x32", argLength: 1},  // arg0 = integer mask value
+	{name: "Cvt64toMask8x64", argLength: 1},  // arg0 = integer mask value
+	{name: "Cvt8toMask16x8", argLength: 1},   // arg0 = integer mask value
+	{name: "Cvt16toMask16x16", argLength: 1}, // arg0 = integer mask value
+	{name: "Cvt32toMask16x32", argLength: 1}, // arg0 = integer mask value
+	{name: "Cvt8toMask32x4", argLength: 1},   // arg0 = integer mask value
+	{name: "Cvt8toMask32x8", argLength: 1},   // arg0 = integer mask value
+	{name: "Cvt16toMask32x16", argLength: 1}, // arg0 = integer mask value
+	{name: "Cvt8toMask64x2", argLength: 1},   // arg0 = integer mask value
+	{name: "Cvt8toMask64x4", argLength: 1},   // arg0 = integer mask value
+	{name: "Cvt8toMask64x8", argLength: 1},   // arg0 = integer mask value
+
+	// Convert masks to integers
+	{name: "CvtMask8x16to16", argLength: 1},  // arg0 = mask
+	{name: "CvtMask8x32to32", argLength: 1},  // arg0 = mask
+	{name: "CvtMask8x64to64", argLength: 1},  // arg0 = mask
+	{name: "CvtMask16x8to8", argLength: 1},   // arg0 = mask
+	{name: "CvtMask16x16to16", argLength: 1}, // arg0 = mask
+	{name: "CvtMask16x32to32", argLength: 1}, // arg0 = mask
+	{name: "CvtMask32x4to8", argLength: 1},   // arg0 = mask
+	{name: "CvtMask32x8to8", argLength: 1},   // arg0 = mask
+	{name: "CvtMask32x16to16", argLength: 1}, // arg0 = mask
+	{name: "CvtMask64x2to8", argLength: 1},   // arg0 = mask
+	{name: "CvtMask64x4to8", argLength: 1},   // arg0 = mask
+	{name: "CvtMask64x8to8", argLength: 1},   // arg0 = mask
+
+	// Returns true if arg0 is all zero.
+	{name: "IsZeroVec", argLength: 1},
+
+	// Returns a mask indicating whether arg0's elements are NaN.
+	{name: "IsNaNFloat32x4", argLength: 1},
+	{name: "IsNaNFloat32x8", argLength: 1},
+	{name: "IsNaNFloat32x16", argLength: 1},
+	{name: "IsNaNFloat64x2", argLength: 1},
+	{name: "IsNaNFloat64x4", argLength: 1},
+	{name: "IsNaNFloat64x8", argLength: 1},
 }
 
 //     kind          controls          successors   implicit exit
@@ -689,6 +754,7 @@ var genericBlocks = []blockData{
 }
 
 func init() {
+	genericOps = append(genericOps, simdGenericOps()...)
 	archs = append(archs, arch{
 		name:    "generic",
 		ops:     genericOps,

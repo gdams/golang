@@ -41,35 +41,15 @@ TEXT _rt0_arm64_lib(SB),NOSPLIT,$184
 	MOVD	R0, _rt0_arm64_lib_argc<>(SB)
 	MOVD	R1, _rt0_arm64_lib_argv<>(SB)
 
-	// Synchronous initialization.
-	MOVD	$runtime·libpreinit(SB), R4
+	MOVD	$runtime·libInit(SB), R4
 	BL	(R4)
 
-	// Create a new thread to do the runtime initialization and return.
-	MOVD	_cgo_sys_thread_create(SB), R4
-	CBZ	R4, nocgo
-	MOVD	$_rt0_arm64_lib_go(SB), R0
-	MOVD	$0, R1
-	SUB	$16, RSP		// reserve 16 bytes for sp-8 where fp may be saved.
-	BL	(R4)
-	ADD	$16, RSP
-	B	restore
-
-nocgo:
-	MOVD	$0x800000, R0                     // stacksize = 8192KB
-	MOVD	$_rt0_arm64_lib_go(SB), R1
-	MOVD	R0, 8(RSP)
-	MOVD	R1, 16(RSP)
-	MOVD	$runtime·newosproc0(SB),R4
-	BL	(R4)
-
-restore:
 	// Restore callee-save registers.
 	RESTORE_R19_TO_R28(24)
 	RESTORE_F8_TO_F15(104)
 	RET
 
-TEXT _rt0_arm64_lib_go(SB),NOSPLIT,$0
+TEXT runtime·rt0_lib_go<ABIInternal>(SB),NOSPLIT,$0
 	MOVD	_rt0_arm64_lib_argc<>(SB), R0
 	MOVD	_rt0_arm64_lib_argv<>(SB), R1
 	MOVD	$runtime·rt0_go(SB),R4
@@ -108,6 +88,14 @@ TEXT runtime·rt0_go(SB),NOSPLIT|TOPFRAME,$0
 	SUB	$32, RSP
 	MOVW	R0, 8(RSP) // argc
 	MOVD	R1, 16(RSP) // argv
+
+	// This is typically the entry point for Go programs.
+	// Call stack unwinding must not proceed past this frame.
+	// Set the frame pointer register to 0 so that frame pointer-based unwinders
+	// (which don't use debug info for performance reasons)
+	// won't attempt to unwind past this function.
+	// See go.dev/issue/63630
+	MOVD	$0, R29
 
 #ifdef TLS_darwin
 	// Initialize TLS.
@@ -248,6 +236,13 @@ TEXT runtime·asminit(SB),NOSPLIT|NOFRAME,$0-0
 	RET
 
 TEXT runtime·mstart(SB),NOSPLIT|TOPFRAME,$0
+	// This is the root frame of new Go-created OS threads.
+	// Call stack unwinding must not proceed past this frame.
+	// Set the frame pointer register to 0 so that frame pointer-based unwinders
+	// (which don't use debug info for performance reasons)
+	// won't attempt to unwind past this function.
+	// See go.dev/issue/63630
+	MOVD	$0, R29
 	BL	runtime·mstart0(SB)
 	RET // not reached
 
@@ -285,6 +280,17 @@ TEXT gogo<>(SB), NOSPLIT|NOFRAME, $0
 // Fn must never return. It should gogo(&g->sched)
 // to keep running g.
 TEXT runtime·mcall<ABIInternal>(SB), NOSPLIT|NOFRAME, $0-8
+#ifdef GOEXPERIMENT_runtimesecret
+	MOVW	g_secret(g), R26
+	CBZ 	R26, nosecret
+	// Use R26 as a secondary link register
+	// We purposefully don't erase it in secretEraseRegistersMcall
+	MOVD	LR, R26
+	BL 	runtime·secretEraseRegistersMcall(SB)
+	MOVD	R26, LR
+
+nosecret:
+#endif
 	MOVD	R0, R26				// context
 
 	// Save caller state in g->sched
@@ -325,6 +331,13 @@ TEXT runtime·systemstack_switch(SB), NOSPLIT, $0-0
 
 // func systemstack(fn func())
 TEXT runtime·systemstack(SB), NOSPLIT, $0-8
+#ifdef GOEXPERIMENT_runtimesecret
+	MOVW	g_secret(g), R3
+	CBZ		R3, nosecret
+	BL 		·secretEraseRegisters(SB)
+
+nosecret:
+#endif
 	MOVD	fn+0(FP), R3	// R3 = fn
 	MOVD	R3, R26		// context
 	MOVD	g_m(g), R4	// R4 = m
@@ -453,6 +466,16 @@ TEXT runtime·morestack(SB),NOSPLIT|NOFRAME,$0-0
 	MOVD	RSP, R0
 	MOVD	R0, (m_morebuf+gobuf_sp)(R8)	// f's caller's RSP
 	MOVD	g, (m_morebuf+gobuf_g)(R8)
+
+	// If in secret mode, erase registers on transition
+	// from G stack to M stack,
+#ifdef GOEXPERIMENT_runtimesecret
+	MOVW	g_secret(g), R4
+	CBZ 	R4, nosecret
+	BL	·secretEraseRegisters(SB)
+	MOVD	g_m(g), R8
+nosecret:
+#endif
 
 	// Call newstack on m->g0's stack.
 	MOVD	m_g0(R8), g
@@ -699,7 +722,7 @@ noaes:
 TEXT runtime·memhash<ABIInternal>(SB),NOSPLIT|NOFRAME,$0-32
 	MOVB	runtime·useAeshash(SB), R10
 	CBZ	R10, noaes
-	B	aeshashbody<>(SB)
+	B	runtime·aeshashbody<>(SB)
 noaes:
 	B	runtime·memhashFallback<ABIInternal>(SB)
 
@@ -708,7 +731,7 @@ TEXT runtime·strhash<ABIInternal>(SB),NOSPLIT|NOFRAME,$0-24
 	MOVB	runtime·useAeshash(SB), R10
 	CBZ	R10, noaes
 	LDP	(R0), (R0, R2)	// string data / length
-	B	aeshashbody<>(SB)
+	B	runtime·aeshashbody<>(SB)
 noaes:
 	B	runtime·strhashFallback<ABIInternal>(SB)
 
@@ -716,7 +739,7 @@ noaes:
 // R1: seed data
 // R2: length
 // At return, R0 = return value
-TEXT aeshashbody<>(SB),NOSPLIT|NOFRAME,$0
+TEXT runtime·aeshashbody<>(SB),NOSPLIT|NOFRAME,$0
 	VEOR	V30.B16, V30.B16, V30.B16
 	VMOV	R1, V30.D[0]
 	VMOV	R2, V30.D[1] // load length into seed
@@ -1036,13 +1059,60 @@ aesloop:
 	VMOV	V0.D[0], R0
 	RET
 
+// The Arm architecture provides a user space accessible counter-timer which
+// is incremented at a fixed but machine-specific rate. Software can (spin)
+// wait until the counter-timer reaches some desired value.
+//
+// Armv8.7-A introduced the WFET (FEAT_WFxT) instruction, which allows the
+// processor to enter a low power state for a set time, or until an event is
+// received.
+//
+// However, WFET is not used here because it is only available on newer hardware,
+// and we aim to maintain compatibility with older Armv8-A platforms that do not
+// support this feature.
+//
+// As a fallback, we can instead use the ISB instruction to decrease processor
+// activity and thus power consumption between checks of the counter-timer.
+// Note that we do not depend on the latency of the ISB instruction which is
+// implementation specific. Actual delay comes from comparing against a fresh
+// read of the counter-timer value.
+//
+// Read more in this Arm blog post:
+// https://community.arm.com/arm-community-blogs/b/architectures-and-processors-blog/posts/multi-threaded-applications-arm
+
 TEXT runtime·procyieldAsm(SB),NOSPLIT,$0-0
 	MOVWU	cycles+0(FP), R0
-	CBZ	R0, done
-again:
-	YIELD
-	SUBW	$1, R0
-	CBNZ	R0, again
+	CBZ	 R0, done
+	//Prevent speculation of subsequent counter/timer reads and memory accesses.
+	ISB     $15
+	// If the delay is very short, just return.
+	// Hardcode 18ns as the first ISB delay.
+	CMP     $18, R0
+	BLS     done
+	// Adjust for overhead of initial ISB.
+	SUB     $18, R0, R0
+	// Convert the delay from nanoseconds to counter/timer ticks.
+	// Read the counter/timer frequency.
+	// delay_ticks = (delay * CNTFRQ_EL0) / 1e9
+	// With the below simplifications and adjustments,
+	// we are usually within 2% of the correct value:
+	// delay_ticks = (delay + delay / 16) * CNTFRQ_EL0 >> 30
+	MRS     CNTFRQ_EL0, R1
+	ADD     R0>>4, R0, R0
+	MUL     R1, R0, R0
+	LSR     $30, R0, R0
+	CBZ     R0, done
+	// start = current counter/timer value
+	MRS     CNTVCT_EL0, R2
+delay:
+	// Delay using ISB for all ticks.
+	ISB     $15
+	// Substract and compare to handle counter roll-over.
+	// counter_read() - start < delay_ticks
+	MRS     CNTVCT_EL0, R1
+	SUB     R2, R1, R1
+	CMP     R0, R1
+	BCC     delay
 done:
 	RET
 
@@ -1081,12 +1151,7 @@ TEXT ·asmcgocall_no_g(SB),NOSPLIT,$0-16
 // aligned appropriately for the gcc ABI.
 // See cgocall.go for more details.
 TEXT ·asmcgocall(SB),NOSPLIT,$0-20
-	MOVD	fn+0(FP), R1
-	MOVD	arg+8(FP), R0
-
-	MOVD	RSP, R2		// save original stack pointer
 	CBZ	g, nosave
-	MOVD	g, R4
 
 	// Figure out if we need to switch to m->g0 stack.
 	// We get called to create new OS threads too, and those
@@ -1099,6 +1164,23 @@ TEXT ·asmcgocall(SB),NOSPLIT,$0-20
 	MOVD	m_g0(R8), R3
 	CMP	R3, g
 	BEQ	nosave
+
+	// running on a user stack. Figure out if we're running
+	// secret code and clear our registers if so.
+#ifdef GOEXPERIMENT_runtimesecret
+	MOVW 	g_secret(g), R5
+	CBZ		R5, nosecret
+	BL 	·secretEraseRegisters(SB)
+	// restore g0 back into R3
+	MOVD	g_m(g), R3
+	MOVD	m_g0(R3), R3
+
+nosecret:
+#endif
+	MOVD	fn+0(FP), R1
+	MOVD	arg+8(FP), R0
+	MOVD	RSP, R2
+	MOVD	g, R4
 
 	// Switch to system stack.
 	MOVD	R0, R9	// gosave_systemstack_switch<> and save_g might clobber R0
@@ -1142,11 +1224,10 @@ nosave:
 	// This code is like the above sequence but without saving/restoring g
 	// and without worrying about the stack moving out from under us
 	// (because we're on a system stack, not a goroutine stack).
-	// The above code could be used directly if already on a system stack,
-	// but then the only path through this code would be a rare case on Solaris.
-	// Using this code for all "already on system stack" calls exercises it more,
-	// which should help keep it correct.
-	MOVD	RSP, R13
+	MOVD	fn+0(FP), R1
+	MOVD	arg+8(FP), R0
+	MOVD	RSP, R2
+	MOVD 	R2, R13
 	SUB	$16, R13
 	MOVD	R13, RSP
 	MOVD	$0, R4

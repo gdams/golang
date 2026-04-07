@@ -16,15 +16,17 @@ import (
 	"strings"
 
 	"golang.org/x/tools/go/analysis"
+	"golang.org/x/tools/go/analysis/passes/inspect"
 	"golang.org/x/tools/go/ast/edge"
 	"golang.org/x/tools/go/ast/inspector"
-	"golang.org/x/tools/internal/analysisinternal/generated"
-	"golang.org/x/tools/internal/astutil"
+	"golang.org/x/tools/internal/analysis/analyzerutil"
+	"golang.org/x/tools/internal/refactor"
+	"golang.org/x/tools/internal/typesinternal/typeindex"
+
 	"golang.org/x/tools/internal/moreiters"
 	"golang.org/x/tools/internal/packagepath"
 	"golang.org/x/tools/internal/stdlib"
 	"golang.org/x/tools/internal/typesinternal"
-	"golang.org/x/tools/internal/versions"
 )
 
 //go:embed doc.go
@@ -33,8 +35,9 @@ var doc string
 // Suite lists all modernize analyzers.
 var Suite = []*analysis.Analyzer{
 	AnyAnalyzer,
+	atomicTypesAnalyzer,
 	// AppendClippedAnalyzer, // not nil-preserving!
-	BLoopAnalyzer,
+	// BLoopAnalyzer, // may skew benchmark results, see golang/go#74967
 	FmtAppendfAnalyzer,
 	ForVarAnalyzer,
 	MapsLoopAnalyzer,
@@ -44,30 +47,21 @@ var Suite = []*analysis.Analyzer{
 	plusBuildAnalyzer,
 	RangeIntAnalyzer,
 	ReflectTypeForAnalyzer,
+	slicesbackwardAnalyzer,
 	SlicesContainsAnalyzer,
 	// SlicesDeleteAnalyzer, // not nil-preserving!
 	SlicesSortAnalyzer,
 	stditeratorsAnalyzer,
+	stringscutAnalyzer,
 	StringsCutPrefixAnalyzer,
 	StringsSeqAnalyzer,
 	StringsBuilderAnalyzer,
 	TestingContextAnalyzer,
-	WaitGroupAnalyzer,
+	unsafeFuncsAnalyzer,
+	WaitGroupGoAnalyzer,
 }
 
 // -- helpers --
-
-// skipGenerated decorates pass.Report to suppress diagnostics in generated files.
-func skipGenerated(pass *analysis.Pass) {
-	report := pass.Report
-	pass.Report = func(diag analysis.Diagnostic) {
-		generated := pass.ResultOf[generated.Analyzer].(*generated.Result)
-		if generated.IsGenerated(diag.Pos) {
-			return // skip
-		}
-		report(diag)
-	}
-}
 
 // formatExprs formats a comma-separated list of expressions.
 func formatExprs(fset *token.FileSet, exprs []ast.Expr) string {
@@ -81,8 +75,8 @@ func formatExprs(fset *token.FileSet, exprs []ast.Expr) string {
 	return buf.String()
 }
 
-// isZeroIntLiteral reports whether e is an integer whose value is 0.
-func isZeroIntLiteral(info *types.Info, e ast.Expr) bool {
+// isZeroIntConst reports whether e is an integer whose value is 0.
+func isZeroIntConst(info *types.Info, e ast.Expr) bool {
 	return isIntLiteral(info, e, 0)
 }
 
@@ -91,34 +85,26 @@ func isIntLiteral(info *types.Info, e ast.Expr, n int64) bool {
 	return info.Types[e].Value == constant.MakeInt64(n)
 }
 
-// filesUsing returns a cursor for each *ast.File in the inspector
+// filesUsingGoVersion returns a cursor for each *ast.File in the inspector
 // that uses at least the specified version of Go (e.g. "go1.24").
 //
+// The pass's analyzer must require [inspect.Analyzer].
+//
 // TODO(adonovan): opt: eliminate this function, instead following the
-// approach of [fmtappendf], which uses typeindex and [fileUses].
-// See "Tip" at [fileUses] for motivation.
-func filesUsing(inspect *inspector.Inspector, info *types.Info, version string) iter.Seq[inspector.Cursor] {
+// approach of [fmtappendf], which uses typeindex and
+// [analyzerutil.FileUsesGoVersion]; see "Tip" documented at the
+// latter function for motivation.
+func filesUsingGoVersion(pass *analysis.Pass, version string) iter.Seq[inspector.Cursor] {
+	inspect := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
+
 	return func(yield func(inspector.Cursor) bool) {
 		for curFile := range inspect.Root().Children() {
 			file := curFile.Node().(*ast.File)
-			if !versions.Before(info.FileVersions[file], version) && !yield(curFile) {
+			if analyzerutil.FileUsesGoVersion(pass, file, version) && !yield(curFile) {
 				break
 			}
 		}
 	}
-}
-
-// fileUses reports whether the specified file uses at least the
-// specified version of Go (e.g. "go1.24").
-//
-// Tip: we recommend using this check "late", just before calling
-// pass.Report, rather than "early" (when entering each ast.File, or
-// each candidate node of interest, during the traversal), because the
-// operation is not free, yet is not a highly selective filter: the
-// fraction of files that pass most version checks is high and
-// increases over time.
-func fileUses(info *types.Info, file *ast.File, version string) bool {
-	return !versions.Before(info.FileVersions[file], version)
 }
 
 // within reports whether the current pass is analyzing one of the
@@ -132,7 +118,7 @@ func within(pass *analysis.Pass, pkgs ...string) bool {
 // unparenEnclosing removes enclosing parens from cur in
 // preparation for a call to [Cursor.ParentEdge].
 func unparenEnclosing(cur inspector.Cursor) inspector.Cursor {
-	for astutil.IsChildOf(cur, edge.ParenExpr_X) {
+	for cur.ParentEdgeKind() == edge.ParenExpr_X {
 		cur = cur.Parent()
 	}
 	return cur
@@ -159,4 +145,40 @@ func lookup(info *types.Info, cur inspector.Cursor, name string) types.Object {
 	scope := typesinternal.EnclosingScope(info, cur)
 	_, obj := scope.LookupParent(name, cur.Node().Pos())
 	return obj
+}
+
+func first[T any](x T, _ any) T { return x }
+
+// freshName returns a fresh name at the given pos and scope based on preferredName.
+// It generates a new name using refactor.FreshName only if:
+// (a) the preferred name is already defined at definedCur, and
+// (b) there are references to it from within usedCur.
+// If useAfterPos.IsValid(), the references must be after
+// useAfterPos within usedCur in order to warrant a fresh name.
+// Otherwise, it returns preferredName, since shadowing is valid in this case.
+// (declaredCur and usedCur may be identical in some use cases).
+func freshName(info *types.Info, index *typeindex.Index, scope *types.Scope, pos token.Pos, defCur inspector.Cursor, useCur inspector.Cursor, useAfterPos token.Pos, preferredName string) string {
+	obj := lookup(info, defCur, preferredName)
+	if obj == nil {
+		// preferredName has not been declared here.
+		return preferredName
+	}
+	for use := range index.Uses(obj) {
+		if useCur.Contains(use) && use.Node().Pos() >= useAfterPos {
+			return refactor.FreshName(scope, pos, preferredName)
+		}
+	}
+	// Name is taken but not used in the given block; shadowing is acceptable.
+	return preferredName
+}
+
+// isLocal reports whether obj is local to some function.
+// Precondition: not a struct field or interface method.
+func isLocal(obj types.Object) bool {
+	// [... 5=stmt 4=func 3=file 2=pkg 1=universe]
+	var depth int
+	for scope := obj.Parent(); scope != nil; scope = scope.Parent() {
+		depth++
+	}
+	return depth >= 4
 }

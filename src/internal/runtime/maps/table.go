@@ -6,7 +6,7 @@ package maps
 
 import (
 	"internal/abi"
-	"internal/goarch"
+	"internal/goexperiment"
 	"internal/runtime/math"
 	"unsafe"
 )
@@ -597,7 +597,7 @@ func (t *table) tombstones() uint16 {
 	return (t.capacity*maxAvgGroupLoad)/abi.MapGroupSlots - t.used - t.growthLeft
 }
 
-// Clear deletes all entries from the map resulting in an empty map.
+// Clear deletes all entries from the table resulting in an empty table.
 func (t *table) Clear(typ *abi.MapType) {
 	mgl := t.maxGrowthLeft()
 	if t.used == 0 && t.growthLeft == mgl { // no current entries and no tombstones
@@ -616,9 +616,16 @@ func (t *table) Clear(typ *abi.MapType) {
 	//  4) But if a group is really large, do the test anyway, as
 	//     clearing is expensive.
 	fullTest := uint64(t.used)*4 <= t.groups.lengthMask // less than ~0.25 entries per group -> >3/4 empty groups
-	if typ.SlotSize > 32 {
-		// For large slots, it is always worth doing the test first.
-		fullTest = true
+	if goexperiment.MapSplitGroup {
+		if (typ.KeyStride + typ.ElemStride) > 32 {
+			// For large slots, it is always worth doing the test first.
+			fullTest = true
+		}
+	} else {
+		if typ.KeyStride > 32 { // KeyStride == SlotSize in interleaved layout
+			// For large slots, it is always worth doing the test first.
+			fullTest = true
+		}
 	}
 	if fullTest {
 		for i := uint64(0); i <= t.groups.lengthMask; i++ {
@@ -1170,7 +1177,7 @@ func (t *table) rehash(typ *abi.MapType, m *Map) {
 
 // Bitmask for the last selection bit at this depth.
 func localDepthMask(localDepth uint8) uintptr {
-	if goarch.PtrSize == 4 {
+	if !Use64BitHash {
 		return uintptr(1) << (32 - localDepth)
 	}
 	return uintptr(1) << (64 - localDepth)
@@ -1261,8 +1268,10 @@ func (t *table) grow(typ *abi.MapType, m *Map, newCapacity uint16) {
 
 // probeSeq maintains the state for a probe sequence that iterates through the
 // groups in a table. The sequence is a triangular progression of the form
+// hash, hash + 1, hash + 1 + 2, hash + 1 + 2 + 3, ..., modulo mask + 1.
+// The i-th term of the sequence is
 //
-//	p(i) := (i^2 + i)/2 + hash (mod mask+1)
+//	p(i) := hash + (i^2 + i)/2 (mod mask+1)
 //
 // The sequence effectively outputs the indexes of *groups*. The group
 // machinery allows us to check an entire group with minimal branching.

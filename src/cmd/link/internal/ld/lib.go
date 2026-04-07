@@ -38,6 +38,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"internal/buildcfg"
+	"internal/platform"
 	"io"
 	"log"
 	"os"
@@ -576,7 +577,8 @@ func (ctxt *Link) loadlib() {
 
 	// Plugins a require cgo support to function. Similarly, plugins may require additional
 	// internal linker support on some platforms which may not be implemented.
-	ctxt.canUsePlugins = ctxt.LibraryByPkg["plugin"] != nil && iscgo
+	ctxt.canUsePlugins = ctxt.LibraryByPkg["plugin"] != nil && iscgo &&
+		platform.BuildModeSupported("gc", "plugin", buildcfg.GOOS, buildcfg.GOARCH)
 
 	// We now have enough information to determine the link mode.
 	determineLinkMode(ctxt)
@@ -923,9 +925,7 @@ func (ctxt *Link) linksetup() {
 		mdsb = ctxt.loader.MakeSymbolUpdater(moduledata)
 		ctxt.loader.SetAttrLocal(moduledata, true)
 	}
-	// In all cases way we mark the moduledata as noptrdata to hide it from
-	// the GC.
-	mdsb.SetType(sym.SNOPTRDATA)
+	mdsb.SetType(sym.SMODULEDATA)
 	ctxt.loader.SetAttrReachable(moduledata, true)
 	ctxt.Moduledata = moduledata
 
@@ -1488,6 +1488,12 @@ func (ctxt *Link) hostlink() {
 				argv = append(argv, "-Wl,-x")
 			}
 		}
+		if *flagRace {
+			// With https://github.com/llvm/llvm-project/pull/182943, the race object
+			// has a weak import of __dyld_get_dyld_header, which is only defined on
+			// newer macOS (26.4+).
+			argv = append(argv, "-Wl,-U,__dyld_get_dyld_header")
+		}
 		if *flagHostBuildid == "none" {
 			argv = append(argv, "-Wl,-no_uuid")
 		}
@@ -1700,22 +1706,48 @@ func (ctxt *Link) hostlink() {
 		}
 
 		if ctxt.Arch.InFamily(sys.ARM64) && buildcfg.GOOS == "linux" {
-			// On ARM64, the GNU linker will fail with
-			// -znocopyreloc if it thinks a COPY relocation is
-			// required. Switch to gold.
+			// On ARM64, the GNU linker had issues with -znocopyreloc
+			// and COPY relocations. This was fixed in GNU ld 2.36+.
 			// https://sourceware.org/bugzilla/show_bug.cgi?id=19962
 			// https://go.dev/issue/22040
-			altLinker = "gold"
+			// And newer gold is deprecated, may lack new features/flags, or even missing
 
-			// If gold is not installed, gcc will silently switch
-			// back to ld.bfd. So we parse the version information
-			// and provide a useful error if gold is missing.
+			// If the default linker is GNU ld 2.35 or older, use gold
+			useGold := false
 			name, args := flagExtld[0], flagExtld[1:]
-			args = append(args, "-fuse-ld=gold", "-Wl,--version")
+			args = append(args, "-Wl,--version")
 			cmd := exec.Command(name, args...)
 			if out, err := cmd.CombinedOutput(); err == nil {
-				if !bytes.Contains(out, []byte("GNU gold")) {
-					log.Fatalf("ARM64 external linker must be gold (issue #15696, 22040), but is not: %s", out)
+				// Parse version from output like "GNU ld (GNU Binutils for Distro) 2.36.1"
+				for line := range strings.Lines(string(out)) {
+					if !strings.HasPrefix(line, "GNU ld ") {
+						continue
+					}
+					fields := strings.Fields(line[len("GNU ld "):])
+					var major, minor int
+					if ret, err := fmt.Sscanf(fields[len(fields)-1], "%d.%d", &major, &minor); ret == 2 && err == nil {
+						if major == 2 && minor <= 35 {
+							useGold = true
+						}
+						break
+					}
+				}
+			}
+
+			if useGold {
+				// Use gold for older linkers
+				altLinker = "gold"
+
+				// If gold is not installed, gcc will silently switch
+				// back to ld.bfd. So we parse the version information
+				// and provide a useful error if gold is missing.
+				args = flagExtld[1:]
+				args = append(args, "-fuse-ld=gold", "-Wl,--version")
+				cmd = exec.Command(name, args...)
+				if out, err := cmd.CombinedOutput(); err == nil {
+					if !bytes.Contains(out, []byte("GNU gold")) {
+						log.Fatalf("ARM64 external linker must be ld>=2.36 or gold (issue #15696, 22040), but is not: %s", out)
+					}
 				}
 			}
 		}
@@ -2208,20 +2240,30 @@ func trimLinkerArgv(argv []string) []string {
 	flagsWithNextArgSkip := []string{
 		"-F",
 		"-l",
-		"-L",
 		"-framework",
 		"-Wl,-framework",
 		"-Wl,-rpath",
 		"-Wl,-undefined",
 	}
 	flagsWithNextArgKeep := []string{
+		"-B",
+		"-L",
 		"-arch",
 		"-isysroot",
 		"--sysroot",
 		"-target",
 		"--target",
+		"-resource-dir",
+		"-rtlib",
+		"--rtlib",
+		"-stdlib",
+		"--stdlib",
+		"-unwindlib",
+		"--unwindlib",
 	}
 	prefixesToKeep := []string{
+		"-B",
+		"-L",
 		"-f",
 		"-m",
 		"-p",
@@ -2231,6 +2273,20 @@ func trimLinkerArgv(argv []string) []string {
 		"--sysroot",
 		"-target",
 		"--target",
+		"-resource-dir",
+		"-rtlib",
+		"--rtlib",
+		"-stdlib",
+		"--stdlib",
+		"-unwindlib",
+		"--unwindlib",
+		"-nostdlib++",
+		"-nostdlib",
+		"-nodefaultlibs",
+		"-nostartfiles",
+		"-nostdinc++",
+		"-nostdinc",
+		"-nobuiltininc",
 	}
 
 	var flags []string
@@ -2355,9 +2411,7 @@ func ldobj(ctxt *Link, f *bio.Reader, lib *sym.Library, length int64, pn string,
 			if len(ls.Resources) != 0 {
 				setpersrc(ctxt, ls.Resources)
 			}
-			if ls.PData != 0 {
-				sehp.pdata = append(sehp.pdata, ls.PData)
-			}
+			sehp.pdata = append(sehp.pdata, ls.PData...)
 			if ls.XData != 0 {
 				sehp.xdata = append(sehp.xdata, ls.XData)
 			}
@@ -2997,7 +3051,7 @@ func AddGotSym(target *Target, ldr *loader.Loader, syms *ArchSyms, s loader.Sym,
 			// Mach-O relocations are a royal pain to lay out.
 			// They use a compact stateful bytecode representation.
 			// Here we record what are needed and encode them later.
-			MachoAddBind(int64(ldr.SymGot(s)), s)
+			MachoAddBind(syms.GOT, int64(ldr.SymGot(s)), s)
 		}
 	} else {
 		ldr.Errorf(s, "addgotsym: unsupported binary format")

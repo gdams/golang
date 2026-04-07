@@ -18,7 +18,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"internal/synctest"
 	"internal/testenv"
 	"io"
 	"log"
@@ -44,6 +43,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -288,7 +288,7 @@ func testHostHandlers(t *testing.T, mode testMode) {
 			if s != vt.expected {
 				t.Errorf("Get(%q) = %q, want %q", vt.url, s, vt.expected)
 			}
-		case StatusMovedPermanently:
+		case StatusTemporaryRedirect:
 			s := r.Header.Get("Location")
 			if s != vt.expected {
 				t.Errorf("Get(%q) = %q, want %q", vt.url, s, vt.expected)
@@ -340,7 +340,7 @@ var serveMuxTests = []struct {
 	pattern string
 }{
 	{"GET", "google.com", "/", 404, ""},
-	{"GET", "google.com", "/dir", 301, "/dir/"},
+	{"GET", "google.com", "/dir", 307, "/dir/"},
 	{"GET", "google.com", "/dir/", 200, "/dir/"},
 	{"GET", "google.com", "/dir/file", 200, "/dir/"},
 	{"GET", "google.com", "/search", 201, "/search"},
@@ -354,14 +354,14 @@ var serveMuxTests = []struct {
 	{"GET", "images.google.com", "/search", 201, "/search"},
 	{"GET", "images.google.com", "/search/", 404, ""},
 	{"GET", "images.google.com", "/search/foo", 404, ""},
-	{"GET", "google.com", "/../search", 301, "/search"},
-	{"GET", "google.com", "/dir/..", 301, ""},
-	{"GET", "google.com", "/dir/..", 301, ""},
-	{"GET", "google.com", "/dir/./file", 301, "/dir/"},
+	{"GET", "google.com", "/../search", 307, "/search"},
+	{"GET", "google.com", "/dir/..", 307, ""},
+	{"GET", "google.com", "/dir/..", 307, ""},
+	{"GET", "google.com", "/dir/./file", 307, "/dir/"},
 
 	// The /foo -> /foo/ redirect applies to CONNECT requests
 	// but the path canonicalization does not.
-	{"CONNECT", "google.com", "/dir", 301, "/dir/"},
+	{"CONNECT", "google.com", "/dir", 307, "/dir/"},
 	{"CONNECT", "google.com", "/../search", 404, ""},
 	{"CONNECT", "google.com", "/dir/..", 200, "/dir/"},
 	{"CONNECT", "google.com", "/dir/..", 200, "/dir/"},
@@ -454,7 +454,7 @@ func TestServeMuxHandlerRedirects(t *testing.T) {
 			h, _ := mux.Handler(r)
 			rr := httptest.NewRecorder()
 			h.ServeHTTP(rr, r)
-			if rr.Code != 301 {
+			if rr.Code != 307 {
 				if rr.Code != tt.code {
 					t.Errorf("%s %s %s = %d, want %d", tt.method, tt.host, tt.url, rr.Code, tt.code)
 				}
@@ -470,6 +470,37 @@ func TestServeMuxHandlerRedirects(t *testing.T) {
 		if tries < 0 {
 			t.Errorf("%s %s %s, too many redirects", tt.method, tt.host, tt.url)
 		}
+	}
+}
+
+func TestServeMuxHandlerRedirectPost(t *testing.T) {
+	setParallel(t)
+	mux := NewServeMux()
+	mux.HandleFunc("POST /test/", func(w ResponseWriter, r *Request) {
+		w.WriteHeader(200)
+	})
+
+	var code, retries int
+	startURL := "http://example.com/test"
+	reqURL := startURL
+	for retries = 0; retries <= 1; retries++ {
+		r := httptest.NewRequest("POST", reqURL, strings.NewReader("hello world"))
+		h, _ := mux.Handler(r)
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, r)
+		code = rr.Code
+		switch rr.Code {
+		case 307:
+			reqURL = rr.Result().Header.Get("Location")
+			continue
+		case 200:
+			// ok
+		default:
+			t.Errorf("unhandled response code: %v", rr.Code)
+		}
+	}
+	if code != 200 {
+		t.Errorf("POST %s = %d after %d retries, want = 200", startURL, code, retries)
 	}
 }
 
@@ -492,8 +523,8 @@ func TestMuxRedirectLeadingSlashes(t *testing.T) {
 			return
 		}
 
-		if code, expected := resp.Code, StatusMovedPermanently; code != expected {
-			t.Errorf("Expected response code of StatusMovedPermanently; got %d", code)
+		if code, expected := resp.Code, StatusTemporaryRedirect; code != expected {
+			t.Errorf("Expected response code of StatusPermanentRedirect; got %d", code)
 			return
 		}
 	}
@@ -579,18 +610,18 @@ func TestServeWithSlashRedirectForHostPatterns(t *testing.T) {
 		want   string
 	}{
 		{"GET", "http://example.com/", 404, "", ""},
-		{"GET", "http://example.com/pkg/foo", 301, "/pkg/foo/", ""},
+		{"GET", "http://example.com/pkg/foo", 307, "/pkg/foo/", ""},
 		{"GET", "http://example.com/pkg/bar", 200, "", "example.com/pkg/bar"},
 		{"GET", "http://example.com/pkg/bar/", 200, "", "example.com/pkg/bar/"},
-		{"GET", "http://example.com/pkg/baz", 301, "/pkg/baz/", ""},
-		{"GET", "http://example.com:3000/pkg/foo", 301, "/pkg/foo/", ""},
+		{"GET", "http://example.com/pkg/baz", 307, "/pkg/baz/", ""},
+		{"GET", "http://example.com:3000/pkg/foo", 307, "/pkg/foo/", ""},
 		{"CONNECT", "http://example.com/", 404, "", ""},
 		{"CONNECT", "http://example.com:3000/", 404, "", ""},
 		{"CONNECT", "http://example.com:9000/", 200, "", "example.com:9000/"},
-		{"CONNECT", "http://example.com/pkg/foo", 301, "/pkg/foo/", ""},
+		{"CONNECT", "http://example.com/pkg/foo", 307, "/pkg/foo/", ""},
 		{"CONNECT", "http://example.com:3000/pkg/foo", 404, "", ""},
-		{"CONNECT", "http://example.com:3000/pkg/baz", 301, "/pkg/baz/", ""},
-		{"CONNECT", "http://example.com:3000/pkg/connect", 301, "/pkg/connect/", ""},
+		{"CONNECT", "http://example.com:3000/pkg/baz", 307, "/pkg/baz/", ""},
+		{"CONNECT", "http://example.com:3000/pkg/connect", 307, "/pkg/connect/", ""},
 	}
 
 	for i, tt := range tests {
@@ -1578,6 +1609,65 @@ func testHeadReaderFrom(t *testing.T, mode testMode) {
 	}
 	if string(gotBody) != wantBody {
 		t.Errorf("got unexpected body len=%v, want %v", len(gotBody), len(wantBody))
+	}
+}
+
+// Ensure ResponseWriter.ReadFrom respects declared Content-Length header.
+// https://go.dev/issue/78179.
+func TestReaderFromTooLong(t *testing.T) { run(t, testReaderFromTooLong, []testMode{http1Mode}) }
+func testReaderFromTooLong(t *testing.T, mode testMode) {
+	contentLen := 600 // Longer than content-sniffing length.
+	tests := []struct {
+		name           string
+		reader         io.Reader
+		wantHandlerErr error
+	}{
+		{
+			name:   "reader of correct length",
+			reader: strings.NewReader(strings.Repeat("a", contentLen)),
+		},
+		{
+			name:   "wrapped reader of correct outer length",
+			reader: io.LimitReader(strings.NewReader(strings.Repeat("a", 2*contentLen)), int64(contentLen)),
+		},
+		{
+			name:   "wrapped reader of correct inner length",
+			reader: io.LimitReader(io.LimitReader(strings.NewReader(strings.Repeat("a", 2*contentLen)), int64(contentLen)), int64(2*contentLen)),
+		},
+		{
+			name:           "reader that is too long",
+			reader:         strings.NewReader(strings.Repeat("a", 2*contentLen)),
+			wantHandlerErr: ErrContentLength,
+		},
+		{
+			name:           "wrapped reader that is too long",
+			reader:         io.LimitReader(strings.NewReader(strings.Repeat("a", 2*contentLen)), int64(2*contentLen)),
+			wantHandlerErr: ErrContentLength,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cst := newClientServerTest(t, mode, HandlerFunc(func(w ResponseWriter, r *Request) {
+				w.Header().Set("Content-Length", strconv.Itoa(contentLen))
+				n, err := w.(io.ReaderFrom).ReadFrom(tc.reader)
+				if int(n) != contentLen || !errors.Is(err, tc.wantHandlerErr) {
+					t.Errorf("got %v, %v from w.ReadFrom; want %v, %v", n, err, contentLen, tc.wantHandlerErr)
+				}
+			}))
+			res, err := cst.c.Get(cst.ts.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer res.Body.Close()
+			gotBody, err := io.ReadAll(res.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(gotBody) != contentLen {
+				t.Errorf("got unexpected body len=%v, want %v", len(gotBody), contentLen)
+			}
+		})
 	}
 }
 
@@ -2847,6 +2937,19 @@ func TestRedirectBadPath(t *testing.T) {
 	Redirect(rr, req, "", 304)
 	if rr.Code != 304 {
 		t.Errorf("Code = %d; want 304", rr.Code)
+	}
+}
+
+func TestRedirectEscapedPath(t *testing.T) {
+	baseURL, redirectURL := "http://example.com/foo%2Fbar/", "qux%2Fbaz"
+	req := httptest.NewRequest("GET", baseURL, NoBody)
+
+	rr := httptest.NewRecorder()
+	Redirect(rr, req, redirectURL, StatusMovedPermanently)
+
+	wantURL := "/foo%2Fbar/qux%2Fbaz"
+	if got := rr.Result().Header.Get("Location"); got != wantURL {
+		t.Errorf("Redirect(%s, %s) = %s, want = %s", baseURL, redirectURL, got, wantURL)
 	}
 }
 
@@ -5967,27 +6070,17 @@ func TestServerCloseDeadlock(t *testing.T) {
 
 // Issue 17717: tests that Server.SetKeepAlivesEnabled is respected by
 // both HTTP/1 and HTTP/2.
-func TestServerKeepAlivesEnabled(t *testing.T) { run(t, testServerKeepAlivesEnabled, testNotParallel) }
+func TestServerKeepAlivesEnabled(t *testing.T) { runSynctest(t, testServerKeepAlivesEnabled) }
 func testServerKeepAlivesEnabled(t *testing.T, mode testMode) {
-	if mode == http2Mode {
-		restore := ExportSetH2GoawayTimeout(10 * time.Millisecond)
-		defer restore()
-	}
-	// Not parallel: messes with global variable. (http2goAwayTimeout)
-	cst := newClientServerTest(t, mode, HandlerFunc(func(w ResponseWriter, r *Request) {}))
+	cst := newClientServerTest(t, mode, HandlerFunc(func(w ResponseWriter, r *Request) {}), optFakeNet)
 	defer cst.close()
 	srv := cst.ts.Config
 	srv.SetKeepAlivesEnabled(false)
-	for try := 0; try < 2; try++ {
-		waitCondition(t, 10*time.Millisecond, func(d time.Duration) bool {
-			if !srv.ExportAllConnsIdle() {
-				if d > 0 {
-					t.Logf("test server still has active conns after %v", d)
-				}
-				return false
-			}
-			return true
-		})
+	for try := range 2 {
+		synctest.Wait()
+		if !srv.ExportAllConnsIdle() {
+			t.Fatalf("test server still has active conns before request %v", try)
+		}
 		conns := 0
 		var info httptrace.GotConnInfo
 		ctx := httptrace.WithClientTrace(context.Background(), &httptrace.ClientTrace{
@@ -6940,7 +7033,7 @@ func TestMuxRedirectRelative(t *testing.T) {
 	if got, want := resp.Header().Get("Location"), "/"; got != want {
 		t.Errorf("Location header expected %q; got %q", want, got)
 	}
-	if got, want := resp.Code, StatusMovedPermanently; got != want {
+	if got, want := resp.Code, StatusTemporaryRedirect; got != want {
 		t.Errorf("Expected response code %d; got %d", want, got)
 	}
 }
@@ -7554,4 +7647,18 @@ func testServerTLSNextProtos(t *testing.T, mode testMode) {
 	if !slices.Equal(nextProtos, wantNextProtos) {
 		t.Fatalf("after running test: original NextProtos slice = %v, want %v", nextProtos, wantNextProtos)
 	}
+}
+
+// Verifies that starting a server with HTTP/2 disabled and an empty TLSConfig does not panic.
+// (Tests fix in CL 758560.)
+func TestServerHTTP2Disabled(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		li := fakeNetListen()
+		srv := &Server{}
+		srv.Protocols = new(Protocols)
+		srv.Protocols.SetHTTP1(true)
+		go srv.ServeTLS(li, "", "")
+		synctest.Wait()
+		srv.Shutdown(t.Context())
+	})
 }

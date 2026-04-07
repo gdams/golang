@@ -118,6 +118,7 @@ func init() {
 	regCtxt := regNamed["X26"]
 	callerSave := gpMask | fpMask | regNamed["g"]
 	r5toR6 := regNamed["X5"] | regNamed["X6"]
+	regX5 := regNamed["X5"]
 
 	var (
 		gpstore  = regInfo{inputs: []regMask{gpspsbMask, gpspMask, 0}} // SB in first input so we can load from a global, but not in second to avoid using SB as a temporary register
@@ -132,6 +133,7 @@ func init() {
 		gpcas    = regInfo{inputs: []regMask{gpspsbgMask, gpgMask, gpgMask}, outputs: []regMask{gpMask}}
 		gpatomic = regInfo{inputs: []regMask{gpspsbgMask, gpgMask}}
 
+		fp01    = regInfo{outputs: []regMask{fpMask}}
 		fp11    = regInfo{inputs: []regMask{fpMask}, outputs: []regMask{fpMask}}
 		fp21    = regInfo{inputs: []regMask{fpMask, fpMask}, outputs: []regMask{fpMask}}
 		fp31    = regInfo{inputs: []regMask{fpMask, fpMask, fpMask}, outputs: []regMask{fpMask}}
@@ -141,9 +143,13 @@ func init() {
 		fpload  = regInfo{inputs: []regMask{gpspsbMask, 0}, outputs: []regMask{fpMask}}
 		fp2gp   = regInfo{inputs: []regMask{fpMask, fpMask}, outputs: []regMask{gpMask}}
 
-		call        = regInfo{clobbers: callerSave}
-		callClosure = regInfo{inputs: []regMask{gpspMask, regCtxt, 0}, clobbers: callerSave}
-		callInter   = regInfo{inputs: []regMask{gpMask}, clobbers: callerSave}
+		call = regInfo{clobbers: callerSave}
+		// Avoid using X5 as the source register of calls. Using X5 here triggers
+		// RAS pop-then-push behavior which is not correct for function calls.
+		// Please refer to section 2.5.1 of the RISC-V ISA
+		// (https://docs.riscv.org/reference/isa/unpriv/rv32.html#rashints) for details.
+		callClosure = regInfo{inputs: []regMask{gpspMask ^ regX5, regCtxt, 0}, clobbers: callerSave}
+		callInter   = regInfo{inputs: []regMask{gpMask ^ regX5}, clobbers: callerSave}
 	)
 
 	RISCV64ops := []opData{
@@ -176,7 +182,9 @@ func init() {
 		{name: "MOVaddr", argLength: 1, reg: gp11sb, asm: "MOV", aux: "SymOff", rematerializeable: true, symEffect: "Addr"}, // arg0 + auxint + offset encoded in aux
 		// auxint+aux == add auxint and the offset of the symbol in aux (if any) to the effective address
 
-		{name: "MOVDconst", reg: gp01, asm: "MOV", typ: "UInt64", aux: "Int64", rematerializeable: true}, // auxint
+		{name: "MOVDconst", reg: gp01, asm: "MOV", typ: "UInt64", aux: "Int64", rematerializeable: true},      // auxint
+		{name: "FMOVDconst", reg: fp01, asm: "MOVD", typ: "Float64", aux: "Float64", rematerializeable: true}, // auxint
+		{name: "FMOVFconst", reg: fp01, asm: "MOVF", typ: "Float32", aux: "Float32", rematerializeable: true}, // auxint
 
 		// Loads: load <size> bits from arg0+auxint+aux and extend to 64 bits; arg1=mem
 		{name: "MOVBload", argLength: 2, reg: gpload, asm: "MOVB", aux: "SymOff", typ: "Int8", faultOnNilArg0: true, symEffect: "Read"},     //  8 bits, sign extend
@@ -273,10 +281,11 @@ func init() {
 		{name: "LoweredRound64F", argLength: 1, reg: fp11, resultInArg0: true},
 
 		// Calls
-		{name: "CALLstatic", argLength: -1, reg: call, aux: "CallOff", call: true},               // call static function aux.(*gc.Sym). last arg=mem, auxint=argsize, returns mem
-		{name: "CALLtail", argLength: -1, reg: call, aux: "CallOff", call: true, tailCall: true}, // tail call static function aux.(*gc.Sym). last arg=mem, auxint=argsize, returns mem
-		{name: "CALLclosure", argLength: -1, reg: callClosure, aux: "CallOff", call: true},       // call function via closure. arg0=codeptr, arg1=closure, last arg=mem, auxint=argsize, returns mem
-		{name: "CALLinter", argLength: -1, reg: callInter, aux: "CallOff", call: true},           // call fn by pointer. arg0=codeptr, last arg=mem, auxint=argsize, returns mem
+		{name: "CALLstatic", argLength: -1, reg: call, aux: "CallOff", call: true},                         // call static function aux.(*gc.Sym). last arg=mem, auxint=argsize, returns mem
+		{name: "CALLtail", argLength: -1, reg: call, aux: "CallOff", call: true, tailCall: true},           // tail call static function aux.(*gc.Sym). last arg=mem, auxint=argsize, returns mem
+		{name: "CALLtailinter", argLength: -1, reg: callInter, aux: "CallOff", call: true, tailCall: true}, // tail call fn by pointer. arg0=codeptr, last arg=mem, auxint=argsize, returns mem
+		{name: "CALLclosure", argLength: -1, reg: callClosure, aux: "CallOff", call: true},                 // call function via closure. arg0=codeptr, arg1=closure, last arg=mem, auxint=argsize, returns mem
+		{name: "CALLinter", argLength: -1, reg: callInter, aux: "CallOff", call: true},                     // call fn by pointer. arg0=codeptr, last arg=mem, auxint=argsize, returns mem
 
 		// Generic moves and zeros
 
@@ -454,6 +463,7 @@ func init() {
 		{name: "FNMADDS", argLength: 3, reg: fp31, asm: "FNMADDS", commutative: true, typ: "Float32"},                                       // -(arg0 * arg1) + arg2
 		{name: "FNMSUBS", argLength: 3, reg: fp31, asm: "FNMSUBS", commutative: true, typ: "Float32"},                                       // -(arg0 * arg1) - arg2
 		{name: "FSQRTS", argLength: 1, reg: fp11, asm: "FSQRTS", typ: "Float32"},                                                            // sqrt(arg0)
+		{name: "FABSS", argLength: 1, reg: fp11, asm: "FABSS", typ: "Float32"},                                                              // abs(arg0)
 		{name: "FNEGS", argLength: 1, reg: fp11, asm: "FNEGS", typ: "Float32"},                                                              // -arg0
 		{name: "FMVSX", argLength: 1, reg: gpfp, asm: "FMVSX", typ: "Float32"},                                                              // reinterpret arg0 as float32
 		{name: "FMVXS", argLength: 1, reg: fpgp, asm: "FMVXS", typ: "Int32"},                                                                // reinterpret arg0 as int32, sign extended to 64 bits
@@ -520,6 +530,10 @@ func init() {
 		//   ====+=============================
 		{name: "FCLASSS", argLength: 1, reg: fpgp, asm: "FCLASSS", typ: "Int64"}, // classify float32
 		{name: "FCLASSD", argLength: 1, reg: fpgp, asm: "FCLASSD", typ: "Int64"}, // classify float64
+
+		// RISC-V Integer Conditional (Zicond) operations extension
+		{name: "CZEROEQZ", argLength: 2, reg: gp21, asm: "CZEROEQZ"}, // arg1 == 0 result is 0, else arg0
+		{name: "CZERONEZ", argLength: 2, reg: gp21, asm: "CZERONEZ"}, // arg1 != 0 result is 0, else arg0
 	}
 
 	RISCV64blocks := []blockData{

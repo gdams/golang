@@ -18,7 +18,6 @@ import (
 	"strings"
 
 	"golang.org/x/tools/go/types/typeutil"
-	"golang.org/x/tools/internal/astutil"
 	"golang.org/x/tools/internal/typeparams"
 	"golang.org/x/tools/internal/typesinternal"
 )
@@ -36,6 +35,7 @@ type gobCallee struct {
 	// results of type analysis (does not reach go/types data structures)
 	PkgPath          string                 // package path of declaring package
 	Name             string                 // user-friendly name for error messages
+	GoVersion        string                 // version of Go effective in callee file
 	Unexported       []string               // names of free objects that are unexported
 	FreeRefs         []freeRef              // locations of references to free objects
 	FreeObjs         []object               // descriptions of free objects
@@ -114,6 +114,24 @@ func AnalyzeCallee(logf func(string, ...any), fset *token.FileSet, pkg *types.Pa
 		return nil, fmt.Errorf("cannot inline function %s as it has no body", name)
 	}
 
+	// Record the file's Go goVersion so that we don't
+	// inline newer code into file using an older dialect.
+	//
+	// Using the file version is overly conservative.
+	// A more precise solution would be for the type checker to
+	// record which language features the callee actually needs;
+	// see https://go.dev/issue/75726.
+	//
+	// We don't have the ast.File handy, so instead of a
+	// lookup we must scan the entire FileVersions map.
+	var goVersion string
+	for file, v := range info.FileVersions {
+		if file.Pos() < decl.Pos() && decl.Pos() < file.End() {
+			goVersion = v
+			break
+		}
+	}
+
 	// Record the location of all free references in the FuncDecl.
 	// (Parameters are not free by this definition.)
 	var (
@@ -126,7 +144,7 @@ func AnalyzeCallee(logf func(string, ...any), fset *token.FileSet, pkg *types.Pa
 	var f func(n ast.Node, stack []ast.Node) bool
 	var stack []ast.Node
 	stack = append(stack, decl.Type) // for scope of function itself
-	visit := func(n ast.Node, stack []ast.Node) { astutil.PreorderStack(n, stack, f) }
+	visit := func(n ast.Node, stack []ast.Node) { ast.PreorderStack(n, stack, f) }
 	f = func(n ast.Node, stack []ast.Node) bool {
 		switch n := n.(type) {
 		case *ast.SelectorExpr:
@@ -342,6 +360,7 @@ func AnalyzeCallee(logf func(string, ...any), fset *token.FileSet, pkg *types.Pa
 		Content:          content,
 		PkgPath:          pkg.Path(),
 		Name:             name,
+		GoVersion:        goVersion,
 		Unexported:       unexported,
 		FreeObjs:         freeObjs,
 		FreeRefs:         freeRefs,
@@ -421,11 +440,11 @@ func analyzeParams(logf func(string, ...any), fset *token.FileSet, info *types.I
 		if sig.Recv() != nil {
 			params = append(params, newParamInfo(sig.Recv(), false))
 		}
-		for i := 0; i < sig.Params().Len(); i++ {
-			params = append(params, newParamInfo(sig.Params().At(i), false))
+		for v := range sig.Params().Variables() {
+			params = append(params, newParamInfo(v, false))
 		}
-		for i := 0; i < sig.Results().Len(); i++ {
-			results = append(results, newParamInfo(sig.Results().At(i), true))
+		for v := range sig.Results().Variables() {
+			results = append(results, newParamInfo(v, true))
 		}
 	}
 
@@ -449,7 +468,7 @@ func analyzeParams(logf func(string, ...any), fset *token.FileSet, info *types.I
 	fieldObjs := fieldObjs(sig)
 	var stack []ast.Node
 	stack = append(stack, decl.Type) // for scope of function itself
-	astutil.PreorderStack(decl.Body, stack, func(n ast.Node, stack []ast.Node) bool {
+	ast.PreorderStack(decl.Body, stack, func(n ast.Node, stack []ast.Node) bool {
 		if id, ok := n.(*ast.Ident); ok {
 			if v, ok := info.Uses[id].(*types.Var); ok {
 				if pinfo, ok := paramInfos[v]; ok {
@@ -497,8 +516,8 @@ func analyzeTypeParams(_ logger, fset *token.FileSet, info *types.Info, decl *as
 	paramInfos := make(map[*types.TypeName]*paramInfo)
 	var params []*paramInfo
 	collect := func(tpl *types.TypeParamList) {
-		for i := range tpl.Len() {
-			typeName := tpl.At(i).Obj()
+		for tparam := range tpl.TypeParams() {
+			typeName := tparam.Obj()
 			info := &paramInfo{Name: typeName.Name()}
 			params = append(params, info)
 			paramInfos[typeName] = info
@@ -513,7 +532,7 @@ func analyzeTypeParams(_ logger, fset *token.FileSet, info *types.Info, decl *as
 	// TODO(jba): can we nevertheless combine this with the traversal in analyzeParams?
 	var stack []ast.Node
 	stack = append(stack, decl.Type) // for scope of function itself
-	astutil.PreorderStack(decl.Body, stack, func(n ast.Node, stack []ast.Node) bool {
+	ast.PreorderStack(decl.Body, stack, func(n ast.Node, stack []ast.Node) bool {
 		if id, ok := n.(*ast.Ident); ok {
 			if v, ok := info.Uses[id].(*types.TypeName); ok {
 				if pinfo, ok := paramInfos[v]; ok {
@@ -639,8 +658,7 @@ func analyzeAssignment(info *types.Info, stack []ast.Node) (assignable, ifaceAss
 				return true, types.IsInterface(under.Elem()), false
 			case *types.Struct: // Struct{k: expr}
 				if id, _ := kv.Key.(*ast.Ident); id != nil {
-					for fi := range under.NumFields() {
-						field := under.Field(fi)
+					for field := range under.Fields() {
 						if info.Uses[id] == field {
 							return true, types.IsInterface(field.Type()), false
 						}
@@ -706,8 +724,48 @@ func analyzeAssignment(info *types.Info, stack []ast.Node) (assignable, ifaceAss
 					paramType := paramTypeAtIndex(sig, call, i)
 					ifaceAssign := paramType == nil || types.IsInterface(paramType)
 					affectsInference := false
-					if fn := typeutil.StaticCallee(info, call); fn != nil {
-						if sig2 := fn.Type().(*types.Signature); sig2.Recv() == nil {
+					switch callee := typeutil.Callee(info, call).(type) {
+					case *types.Builtin:
+						// Consider this litmus test:
+						//
+						//   func f(x int64) any { return max(x) }
+						//   func main() { fmt.Printf("%T", f(42)) }
+						//
+						// If we lose the implicit conversion from untyped int
+						// to int64, the type inferred for the max(x) call changes,
+						// resulting in a different dynamic behavior: it prints
+						// int, not int64.
+						//
+						// Inferred result type affected:
+						//    new
+						//    complex, real, imag
+						//    min, max
+						//
+						// Dynamic behavior change:
+						//    append         -- dynamic type of append([]any(nil), x)[0]
+						//    delete(m, x)   -- dynamic key type where m is map[any]unit
+						//    panic          -- dynamic type of panic value
+						//
+						// Unaffected:
+						//    recover
+						//    make
+						//    len, cap
+						//    clear
+						//    close
+						//    copy
+						//    print, println  -- only uses underlying types (?)
+						//
+						// The dynamic type cases are all covered by
+						// the ifaceAssign logic.
+						switch callee.Name() {
+						case "new", "complex", "real", "imag", "min", "max":
+							affectsInference = true
+						}
+
+					case *types.Func:
+						// Only standalone (non-method) functions have type
+						// parameters affected by the call arguments.
+						if sig2 := callee.Signature(); sig2.Recv() == nil {
 							originParamType := paramTypeAtIndex(sig2, call, i)
 							affectsInference = originParamType == nil || new(typeparams.Free).Has(originParamType)
 						}

@@ -16,6 +16,8 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+
+	"cmd/go/internal/cfg"
 )
 
 // pickUnusedPort finds an unused port by trying to listen on port 0
@@ -48,6 +50,10 @@ func doPkgsite(urlPath, fragment string) error {
 		path += "#" + fragment
 	}
 
+	if file := os.Getenv("TEST_GODOC_URL_FILE"); file != "" {
+		return os.WriteFile(file, []byte(path+"\n"), 0666)
+	}
+
 	// Turn off the default signal handler for SIGINT (and SIGQUIT on Unix)
 	// and instead wait for the child process to handle the signal and
 	// exit before exiting ourselves.
@@ -71,9 +77,9 @@ func doPkgsite(urlPath, fragment string) error {
 		env = append(env, "GOPROXY="+gomodcache+","+goproxy)
 	}
 
-	const version = "v0.0.0-20250714212547-01b046e81fe7"
+	const version = "v0.0.0-20251223195805-1a3bd3c788fe"
 	cmd := exec.Command(goCmd(), "run", "golang.org/x/pkgsite/cmd/internal/doc@"+version,
-		"-gorepo", buildCtx.GOROOT,
+		"-gorepo", cfg.GOROOT,
 		"-http", addr,
 		"-open", path)
 	cmd.Env = env

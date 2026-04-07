@@ -245,6 +245,7 @@ func ssaGenValue(s *ssagen.State, v *ssa.Value) {
 		p.To.Type = obj.TYPE_REG
 		p.To.Reg = r
 	case ssa.OpARMADDS,
+		ssa.OpARMADCS,
 		ssa.OpARMSUBS:
 		r := v.Reg0()
 		r1 := v.Args[0].Reg()
@@ -700,7 +701,7 @@ func ssaGenValue(s *ssagen.State, v *ssa.Value) {
 		p.To.Reg = v.Reg()
 	case ssa.OpARMCALLstatic, ssa.OpARMCALLclosure, ssa.OpARMCALLinter:
 		s.Call(v)
-	case ssa.OpARMCALLtail:
+	case ssa.OpARMCALLtail, ssa.OpARMCALLtailinter:
 		s.TailCall(v)
 	case ssa.OpARMCALLudiv:
 		p := s.Prog(obj.ACALL)

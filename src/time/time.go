@@ -260,7 +260,11 @@ func (t *Time) mono() int64 {
 // IsZero reports whether t represents the zero time instant,
 // January 1, year 1, 00:00:00 UTC.
 func (t Time) IsZero() bool {
-	return t.sec() == 0 && t.nsec() == 0
+	// If hasMonotonic is set in t.wall, then the time can't be before 1885, so it can't be the year 1.
+	// If hasMonotonic is zero, then all the bits in wall other than the nanoseconds field should be 0.
+	// So if there are no nanoseconds then t.wall == 0, and if there are no seconds then t.ext == 0.
+	// This is equivalent to t.sec() == 0 && t.nsec() == 0, but is more efficient.
+	return t.wall == 0 && t.ext == 0
 }
 
 // After reports whether the time instant t is after u.
@@ -1275,7 +1279,7 @@ func daysBefore(m Month) int {
 	// which is:
 	//	0  31  61  92 122 153 183 214 245 275 306 336 367
 	// This is almost exactly 367/12×(m-1) except for the
-	// occasonal off-by-one suggesting there may be an
+	// occasional off-by-one suggesting there may be an
 	// integer approximation of the form (a×m + b)/c.
 	// A brute force search over small a, b, c finds that
 	// (214×m - 211) / 7 computes the function perfectly.
@@ -1548,7 +1552,7 @@ func (t *Time) UnmarshalBinary(data []byte) error {
 	buf = buf[4:]
 	offset := int(int16(buf[1])|int16(buf[0])<<8) * 60
 	if version == timeBinaryVersionV2 {
-		offset += int(buf[2])
+		offset += int(int8(buf[2]))
 	}
 
 	*t = Time{}

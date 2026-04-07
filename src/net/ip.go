@@ -14,7 +14,7 @@ package net
 
 import (
 	"internal/bytealg"
-	"internal/itoa"
+	"internal/strconv"
 	"internal/stringslite"
 	"net/netip"
 )
@@ -132,6 +132,10 @@ func (ip IP) IsLoopback() bool {
 
 // IsPrivate reports whether ip is a private address, according to
 // RFC 1918 (IPv4 addresses) and RFC 4193 (IPv6 addresses).
+// That is, it reports whether ip is in 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, or fc00::/7.
+//
+// IsPrivate does not describe a security property of addresses,
+// and should not be used for access control.
 func (ip IP) IsPrivate() bool {
 	if ip4 := ip.To4(); ip4 != nil {
 		// Following RFC 1918, Section 3. Private Address Space which says:
@@ -515,7 +519,7 @@ func (n *IPNet) String() string {
 	if l == -1 {
 		return nn.String() + "/" + m.String()
 	}
-	return nn.String() + "/" + itoa.Uitoa(uint(l))
+	return nn.String() + "/" + strconv.Itoa(l)
 }
 
 // ParseIP parses s as an IP address, returning the result.

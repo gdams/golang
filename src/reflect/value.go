@@ -8,8 +8,9 @@ import (
 	"errors"
 	"internal/abi"
 	"internal/goarch"
-	"internal/itoa"
+	"internal/strconv"
 	"internal/unsafeheader"
+	"iter"
 	"math"
 	"runtime"
 	"unsafe"
@@ -361,6 +362,7 @@ func (v Value) CanSet() bool {
 // type of the function's corresponding input parameter.
 // If v is a variadic function, Call creates the variadic slice parameter
 // itself, copying in the corresponding values.
+// It panics if the Value was obtained by accessing unexported struct fields.
 func (v Value) Call(in []Value) []Value {
 	v.mustBe(Func)
 	v.mustBeExported()
@@ -374,6 +376,7 @@ func (v Value) Call(in []Value) []Value {
 // It returns the output results as Values.
 // As in Go, each input argument must be assignable to the
 // type of the function's corresponding input parameter.
+// It panics if the Value was obtained by accessing unexported struct fields.
 func (v Value) CallSlice(in []Value) []Value {
 	v.mustBe(Func)
 	v.mustBeExported()
@@ -1279,6 +1282,18 @@ func (v Value) Field(i int) Value {
 			fl |= flagStickyRO
 		}
 	}
+	if fl&flagIndir == 0 && typ.Size() == 0 {
+		// Special case for picking a field out of a direct struct.
+		// A direct struct must have a pointer field and possibly a
+		// bunch of zero-sized fields. We must return the zero-sized
+		// fields indirectly, as only ptr-shaped things can be direct.
+		// See issue 74935.
+		// We use &zeroVal[0] instead of v.ptr as it doesn't matter and
+		// we can avoid pinning a possibly now-unused object.
+		// Don't use nil, see issue 77779.
+		return Value{typ, unsafe.Pointer(&zeroVal[0]), fl | flagIndir}
+	}
+
 	// Either flagIndir is set and v.ptr points at struct,
 	// or flagIndir is not set and v.ptr is the actual struct data.
 	// In the former case, we want v.ptr + offset.
@@ -1500,6 +1515,17 @@ func valueInterface(v Value, safe bool) any {
 // TypeAssert is semantically equivalent to:
 //
 //	v2, ok := v.Interface().(T)
+//
+// Note that this function, just as the type assertion above, might return:
+//
+//   - ok == false when v.Type() == reflect.TypeFor[T]()
+//     For example, when both T and v are interface types and v.IsNil() == true.
+//     In that case v.Interface() returns a nil interface value, and the
+//     assertion .(T) fails with ok == false.
+//
+//   - ok == true when v.Type() != reflect.TypeFor[T]().
+//     For example, when T is an interface type and v holds a value whose
+//     concrete type implements T.
 func TypeAssert[T any](v Value) (T, bool) {
 	if v.flag == 0 {
 		panic(&ValueError{"reflect.TypeAssert", Invalid})
@@ -2620,6 +2646,48 @@ func (v Value) UnsafePointer() unsafe.Pointer {
 	panic(&ValueError{"reflect.Value.UnsafePointer", v.kind()})
 }
 
+// Fields returns an iterator over each [StructField] of v along with its [Value].
+//
+// The sequence is equivalent to calling [Value.Field] successively
+// for each index i in the range [0, NumField()).
+//
+// It panics if v's Kind is not Struct.
+func (v Value) Fields() iter.Seq2[StructField, Value] {
+	t := v.Type()
+	if t.Kind() != Struct {
+		panic("reflect: Fields of non-struct type " + t.String())
+	}
+	return func(yield func(StructField, Value) bool) {
+		for i := range v.NumField() {
+			if !yield(t.Field(i), v.Field(i)) {
+				return
+			}
+		}
+	}
+}
+
+// Methods returns an iterator over each [Method] of v along with the corresponding
+// method [Value]; this is a function with v bound as the receiver. As such, the
+// receiver shouldn't be included in the arguments to [Value.Call].
+//
+// The sequence is equivalent to calling [Value.Method] successively
+// for each index i in the range [0, NumMethod()).
+//
+// Methods panics if v is a nil interface value.
+//
+// Calling this method will force the linker to retain all exported methods in all packages.
+// This may make the executable binary larger but will not affect execution time.
+func (v Value) Methods() iter.Seq2[Method, Value] {
+	return func(yield func(Method, Value) bool) {
+		rtype := v.Type()
+		for i := range v.NumMethod() {
+			if !yield(rtype.Method(i), v.Method(i)) {
+				return
+			}
+		}
+	}
+}
+
 // StringHeader is the runtime representation of a string.
 // It cannot be used safely or portably and its representation may
 // change in a later release.
@@ -2866,6 +2934,10 @@ type SelectCase struct {
 	Send Value     // value to send (for send)
 }
 
+// stackAllocSelectCases represents the length of a slice that we
+// pre-allocate in [Select] to avoid heap allocations.
+const stackAllocSelectCases = 4
+
 // Select executes a select operation described by the list of cases.
 // Like the Go select statement, it blocks until at least one of the cases
 // can proceed, makes a uniform pseudo-random choice,
@@ -2875,22 +2947,42 @@ type SelectCase struct {
 // (as opposed to a zero value received because the channel is closed).
 // Select supports a maximum of 65536 cases.
 func Select(cases []SelectCase) (chosen int, recv Value, recvOK bool) {
+	// This function is specially designed to be inlined, such that when called as:
+	//
+	// Select([]SelectCase{})
+	//
+	// With a slice, that has a compile known length, the runcases slice
+	// will end up being stack allocated, since the compiler can infer
+	// the len([]SelectCase{}).
+	//
+	// We additionaly want to optimize Select(cases) for cases where len(cases)
+	// cannot be infered at compile-time, thus in [select0] we allocate a
+	// [stackAllocSelectCases]-length slice, which will avoid memory allocations
+	// when the len(cases) <= stackAllocSelectCases and len(cases) is not compile-known.
+
+	var runcases []runtimeSelect
+	if len(cases) > stackAllocSelectCases {
+		runcases = make([]runtimeSelect, len(cases))
+	}
+	chosen, recv, recvOK = select0(cases, runcases)
+	return
+}
+
+func select0(cases []SelectCase, runcases []runtimeSelect) (chosen int, recv Value, recvOK bool) {
 	if len(cases) > 65536 {
 		panic("reflect.Select: too many cases (max 65536)")
 	}
-	// NOTE: Do not trust that caller is not modifying cases data underfoot.
-	// The range is safe because the caller cannot modify our copy of the len
-	// and each iteration makes its own copy of the value c.
-	var runcases []runtimeSelect
-	if len(cases) > 4 {
-		// Slice is heap allocated due to runtime dependent capacity.
-		runcases = make([]runtimeSelect, len(cases))
-	} else {
-		// Slice can be stack allocated due to constant capacity.
-		runcases = make([]runtimeSelect, len(cases), 4)
+
+	// See [Select] for more details on this.
+	if runcases == nil {
+		runcases = make([]runtimeSelect, len(cases), stackAllocSelectCases)
 	}
 
 	haveDefault := false
+
+	// NOTE: Do not trust that caller is not modifying cases data underfoot.
+	// The range is safe because the caller cannot modify our copy of the len
+	// and each iteration makes its own copy of the value c.
 	for i, c := range cases {
 		rc := &runcases[i]
 		rc.dir = c.Dir
@@ -3221,8 +3313,8 @@ func (v Value) Comparable() bool {
 		return v.IsNil() || v.Elem().Comparable()
 
 	case Struct:
-		for i := 0; i < v.NumField(); i++ {
-			if !v.Field(i).Comparable() {
+		for _, value := range v.Fields() {
+			if !value.Comparable() {
 				return false
 			}
 		}
@@ -3348,7 +3440,7 @@ func convertOp(dst, src *abi.Type) func(Value, Type) Value {
 		}
 
 	case String:
-		if dst.Kind() == abi.Slice && pkgPathFor(dst.Elem()) == "" {
+		if dst.Kind() == abi.Slice {
 			switch Kind(dst.Elem().Kind()) {
 			case Uint8:
 				return cvtStringBytes
@@ -3358,7 +3450,7 @@ func convertOp(dst, src *abi.Type) func(Value, Type) Value {
 		}
 
 	case Slice:
-		if dst.Kind() == abi.String && pkgPathFor(src.Elem()) == "" {
+		if dst.Kind() == abi.String {
 			switch Kind(src.Elem().Kind()) {
 			case Uint8:
 				return cvtBytesString
@@ -3573,7 +3665,7 @@ func cvtStringRunes(v Value, t Type) Value {
 func cvtSliceArrayPtr(v Value, t Type) Value {
 	n := t.Elem().Len()
 	if n > v.Len() {
-		panic("reflect: cannot convert slice with length " + itoa.Itoa(v.Len()) + " to pointer to array with length " + itoa.Itoa(n))
+		panic("reflect: cannot convert slice with length " + strconv.Itoa(v.Len()) + " to pointer to array with length " + strconv.Itoa(n))
 	}
 	h := (*unsafeheader.Slice)(v.ptr)
 	return Value{t.common(), h.Data, v.flag&^(flagIndir|flagAddr|flagKindMask) | flag(Pointer)}
@@ -3583,7 +3675,7 @@ func cvtSliceArrayPtr(v Value, t Type) Value {
 func cvtSliceArray(v Value, t Type) Value {
 	n := t.Len()
 	if n > v.Len() {
-		panic("reflect: cannot convert slice with length " + itoa.Itoa(v.Len()) + " to array with length " + itoa.Itoa(n))
+		panic("reflect: cannot convert slice with length " + strconv.Itoa(v.Len()) + " to array with length " + strconv.Itoa(n))
 	}
 	h := (*unsafeheader.Slice)(v.ptr)
 	typ := t.common()

@@ -55,7 +55,7 @@ file.
 
 The -x flag causes tidy to print the commands download executes.
 
-See https://golang.org/ref/mod#go-mod-tidy for more about 'go mod tidy'.
+See https://go.dev/ref/mod#go-mod-tidy for more about 'go mod tidy'.
 	`,
 	Run: runTidy,
 }
@@ -105,6 +105,7 @@ func (f *goVersionFlag) Set(s string) error {
 }
 
 func runTidy(ctx context.Context, cmd *base.Command, args []string) {
+	moduleLoader := modload.NewLoader()
 	if len(args) > 0 {
 		base.Fatalf("go: 'go mod tidy' accepts no arguments")
 	}
@@ -119,18 +120,18 @@ func runTidy(ctx context.Context, cmd *base.Command, args []string) {
 	// those packages. In order to make 'go test' reproducible for the packages
 	// that are in 'all' but outside of the main module, we must explicitly
 	// request that their test dependencies be included.
-	modload.LoaderState.ForceUseModules = true
-	modload.LoaderState.RootMode = modload.NeedRoot
+	moduleLoader.ForceUseModules = true
+	moduleLoader.RootMode = modload.NeedRoot
 
 	goVersion := tidyGo.String()
 	if goVersion != "" && gover.Compare(gover.Local(), goVersion) < 0 {
-		toolchain.SwitchOrFatal(modload.LoaderState, ctx, &gover.TooNewError{
+		toolchain.SwitchOrFatal(moduleLoader, ctx, &gover.TooNewError{
 			What:      "-go flag",
 			GoVersion: goVersion,
 		})
 	}
 
-	modload.LoadPackages(modload.LoaderState, ctx, modload.PackageOpts{
+	modload.LoadPackages(moduleLoader, ctx, modload.PackageOpts{
 		TidyGoVersion:            tidyGo.String(),
 		Tags:                     imports.AnyTags(),
 		Tidy:                     true,
@@ -141,6 +142,6 @@ func runTidy(ctx context.Context, cmd *base.Command, args []string) {
 		LoadTests:                true,
 		AllowErrors:              tidyE,
 		SilenceMissingStdImports: true,
-		Switcher:                 toolchain.NewSwitcher(modload.LoaderState),
+		Switcher:                 toolchain.NewSwitcher(moduleLoader),
 	}, "all")
 }
