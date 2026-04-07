@@ -1,0 +1,125 @@
+# Copyright 2026 The Go Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+
+# This workflow is triggered by LUCI (via the gabuilder bridge) to run
+# Go tests on windows/arm64 GitHub Actions runners. It checks out the
+# Go source tree at the requested commit, bootstraps the toolchain,
+# and runs the test suite. Results are uploaded as artifacts and the
+# workflow exit status is used by the bridge to report back to LUCI.
+
+name: windows-arm64-test
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: "Go repository commit SHA to test"
+        required: true
+        type: string
+      build_id:
+        description: "LUCI build ID for correlation"
+        required: false
+        type: string
+        default: ""
+      test_shards:
+        description: "Number of test shards (GO_TEST_SHARDS)"
+        required: false
+        type: string
+        default: "1"
+      builder_name:
+        description: "GO_BUILDER_NAME to set in environment"
+        required: false
+        type: string
+        default: "gotip-windows-arm64-github"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-11-arm
+    timeout-minutes: 120
+    env:
+      GO_BUILDER_NAME: ${{ inputs.builder_name }}
+      GO_TEST_SHARDS: ${{ inputs.test_shards }}
+      GOROOT_BOOTSTRAP: C:\hostedtoolcache\go\bootstrap
+
+    steps:
+      - name: Checkout Go source
+        uses: actions/checkout@v4
+        with:
+          repository: golang/go
+          ref: ${{ inputs.commit_sha }}
+          fetch-depth: 1
+
+      - name: Set up bootstrap Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache: false
+
+      - name: Record bootstrap location
+        shell: pwsh
+        run: |
+          $bootstrapDir = Split-Path -Parent (Get-Command go).Source
+          # Go bootstrap expects GOROOT_BOOTSTRAP to point to the root,
+          # not the bin directory.
+          $goroot = Split-Path -Parent $bootstrapDir
+          echo "GOROOT_BOOTSTRAP=$goroot" >> $env:GITHUB_ENV
+          echo "Bootstrap GOROOT: $goroot"
+          go version
+
+      - name: Build Go toolchain
+        shell: pwsh
+        working-directory: src
+        run: |
+          echo "::group::make.bat"
+          .\make.bat
+          echo "::endgroup::"
+
+      - name: Run tests
+        id: run_tests
+        shell: pwsh
+        working-directory: src
+        run: |
+          $env:PATH = "${{ github.workspace }}\bin;$env:PATH"
+          echo "Using Go: $(go version)"
+          echo "Builder: $env:GO_BUILDER_NAME"
+          echo "Build ID: ${{ inputs.build_id }}"
+          echo "::group::run.bat"
+          .\run.bat 2>&1 | Tee-Object -FilePath "${{ github.workspace }}\test-output.txt"
+          $exitCode = $LASTEXITCODE
+          echo "::endgroup::"
+          echo "test_exit_code=$exitCode" >> $env:GITHUB_OUTPUT
+          exit $exitCode
+
+      - name: Upload test output
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results-${{ inputs.commit_sha }}
+          path: test-output.txt
+          retention-days: 7
+
+      - name: Upload build metadata
+        if: always()
+        shell: pwsh
+        run: |
+          $meta = @{
+            commit_sha = "${{ inputs.commit_sha }}"
+            build_id = "${{ inputs.build_id }}"
+            builder_name = "${{ inputs.builder_name }}"
+            runner_os = "${{ runner.os }}"
+            runner_arch = "${{ runner.arch }}"
+            status = if (${{ steps.run_tests.outcome == 'success' }}) { "pass" } else { "fail" }
+          } | ConvertTo-Json
+          $meta | Out-File -FilePath "${{ github.workspace }}\build-metadata.json" -Encoding utf8
+
+      - name: Upload metadata artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-metadata-${{ inputs.commit_sha }}
+          path: build-metadata.json
+          retention-days: 7
