@@ -79,8 +79,8 @@ jobs:
         shell: pwsh
         run: |
           # Git-for-Windows ships an x86-64 MinGW gcc that cannot compile ARM64 assembly.
-          # Replace it with LLVM clang (pre-installed on this image) targeting
-          # aarch64-pc-windows-msvc, using the MSVC ARM64 toolchain for linking.
+          # Replace it with LLVM clang targeting aarch64-pc-windows-msvc, using the MSVC
+          # ARM64 toolchain for linking.
           #
           # Find Visual Studio and activate the ARM64 MSVC environment so that
           # clang can find the ARM64 CRT and SDK libs.
@@ -111,12 +111,24 @@ jobs:
             }
           }
 
-          # LLVM clang is pre-installed; make sure it is on PATH and set CC/CXX
-          $llvmBin = "C:\Program Files\LLVM\bin"
-          echo $llvmBin >> $env:GITHUB_PATH
-          Write-Output "clang: $(& "$llvmBin\clang.exe" --version 2>&1 | Select-Object -First 1)"
+          # The VS-integrated ARM64 LLVM clang compiles for ARM64 by default.
+          # Add it to the front of GITHUB_PATH so it takes precedence over the
+          # standalone LLVM (which defaults to x64) and the MinGW gcc.
+          $vsClangArm64 = Join-Path $vsPath "VC\Tools\Llvm\ARM64\bin"
+          if (Test-Path $vsClangArm64) {
+            Write-Output "Using VS ARM64 clang: $vsClangArm64"
+            echo $vsClangArm64 >> $env:GITHUB_PATH
+            $env:PATH = "$vsClangArm64;$env:PATH"
+          } else {
+            Write-Output "VS ARM64 clang not found at $vsClangArm64, falling back to standalone LLVM"
+            $llvmBin = "C:\Program Files\LLVM\bin"
+            echo $llvmBin >> $env:GITHUB_PATH
+            $env:PATH = "$llvmBin;$env:PATH"
+          }
+          Write-Output "clang: $(clang --version 2>&1 | Select-Object -First 1)"
+          Write-Output "clang target: $(clang -print-target-triple 2>&1)"
 
-          # Tell the Go build to use clang (which will auto-detect the MSVC sysroot via VCTOOLSINSTALLDIR)
+          # Tell the Go build to use clang
           echo "CC=clang" >> $env:GITHUB_ENV
           echo "CXX=clang++" >> $env:GITHUB_ENV
 
