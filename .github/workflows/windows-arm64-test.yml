@@ -73,21 +73,47 @@ jobs:
       - name: Set up ARM64-capable C compiler
         shell: pwsh
         run: |
-          # The Git-for-Windows gcc is an x86-64 assembler and cannot compile
-          # runtime/cgo/gcc_arm64.S. Use LLVM clang which supports ARM64 natively.
-          if (Get-Command clang -ErrorAction SilentlyContinue) {
-            $v = (clang --version 2>&1 | Select-Object -First 1)
-            Write-Output "Found clang: $v"
-          } else {
-            Write-Output "clang not found, installing LLVM via chocolatey..."
-            choco install llvm -y --no-progress
-            $llvmBin = "C:\Program Files\LLVM\bin"
-            echo $llvmBin >> $env:GITHUB_PATH
-            $env:PATH = "$llvmBin;$env:PATH"
-            $v = (clang --version 2>&1 | Select-Object -First 1)
-            Write-Output "Installed: $v"
+          # Git-for-Windows ships an x86-64 MinGW gcc that cannot compile ARM64 assembly.
+          # Replace it with LLVM clang (pre-installed on this image) targeting
+          # aarch64-pc-windows-msvc, using the MSVC ARM64 toolchain for linking.
+          #
+          # Find Visual Studio and activate the ARM64 MSVC environment so that
+          # clang can find the ARM64 CRT and SDK libs.
+          $vsPath = & "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" `
+            -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 `
+            -property installationPath 2>$null
+          if (-not $vsPath) {
+            # Try without the ARM64 requirement in case the name changed
+            $vsPath = & "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" `
+              -latest -products * -property installationPath 2>$null
           }
+          Write-Output "VS path: $vsPath"
+
+          # Locate vcvarsall.bat
+          $vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvarsall.bat"
+          if (-not (Test-Path $vcvars)) {
+            Write-Error "vcvarsall.bat not found at $vcvars"
+            exit 1
+          }
+
+          # Run vcvarsall for arm64 and export path/lib/include changes to GITHUB_ENV
+          $output = cmd /c "`"$vcvars`" arm64 && set"
+          $output | ForEach-Object {
+            if ($_ -match '^(PATH|LIB|LIBPATH|INCLUDE|VCTOOLSINSTALLDIR|WindowsSdkDir|WindowsSDKVersion|VCINSTALLDIR)=(.+)$') {
+              $name = $matches[1]
+              $val  = $matches[2]
+              echo "$name=$val" >> $env:GITHUB_ENV
+            }
+          }
+
+          # LLVM clang is pre-installed; make sure it is on PATH and set CC/CXX
+          $llvmBin = "C:\Program Files\LLVM\bin"
+          echo $llvmBin >> $env:GITHUB_PATH
+          Write-Output "clang: $(& "$llvmBin\clang.exe" --version 2>&1 | Select-Object -First 1)"
+
+          # Tell the Go build to use clang (which will auto-detect the MSVC sysroot via VCTOOLSINSTALLDIR)
           echo "CC=clang" >> $env:GITHUB_ENV
+          echo "CXX=clang++" >> $env:GITHUB_ENV
 
       - name: Build Go toolchain
         shell: pwsh
