@@ -54,9 +54,16 @@ jobs:
       - name: Checkout Go source
         shell: pwsh
         run: |
-          git clone --depth 1 ${{ inputs.repository }} .
+          # Clone into a temp location then move contents into the workspace.
+          # The workspace may already contain the workflow repo checkout.
+          $src = "$env:TEMP\go-src"
+          git clone --depth 1 --no-checkout "${{ inputs.repository }}" $src
+          Push-Location $src
           git fetch --depth 1 origin ${{ inputs.commit_sha }}
           git checkout ${{ inputs.commit_sha }}
+          Pop-Location
+          # Move everything (including .git) into the workspace root.
+          Get-ChildItem -Path $src -Force | Move-Item -Destination . -Force
 
       - name: Set up bootstrap Go
         uses: actions/setup-go@v6

@@ -51,7 +51,7 @@ var (
 	flagTestShards   = flag.String("test-shards", "1", "number of test shards")
 	flagPollInterval = flag.Duration("poll-interval", 30*time.Second, "interval between status polls")
 	flagTimeout      = flag.Duration("timeout", 150*time.Minute, "overall timeout for the workflow run")
-	flagGoRepo       = flag.String("go-repo", "golang/go", "Go source repository to check out inside the workflow (owner/repo)")
+	flagGoRepo       = flag.String("go-repo", "https://go.googlesource.com/go", "Go source repository URL to clone inside the workflow")
 )
 
 func main() {
