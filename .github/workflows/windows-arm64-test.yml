@@ -75,21 +75,50 @@ jobs:
           echo "Bootstrap GOROOT: $goroot"
           go version
 
-      - name: Checkout Go build infrastructure
-        uses: actions/checkout@v4
-        with:
-          repository: golang/build
-          path: gobuilder
-          fetch-depth: 1
-
-      - name: Set up build environment
+      - name: Install llvm-mingw toolchain
         shell: pwsh
         run: |
-          # Run the official windows-arm64 setup script. This installs the
-          # C toolchain, test certificates, and other dependencies that
-          # the Go test suite expects.
+          # Go's CGO on Windows expects a MinGW-compatible C toolchain.
+          # The Azure startup.ps1 notes that LUCI builders get compilers
+          # via CIPD; for GitHub Actions we download llvm-mingw directly.
           # See: https://github.com/golang/build/blob/master/env/windows-arm64/azure/startup.ps1
-          & ${{ github.workspace }}\gobuilder\env\windows-arm64\azure\startup.ps1
+          $version = "20250514"
+          $archive = "llvm-mingw-${version}-ucrt-aarch64.zip"
+          $url = "https://github.com/mstorsjo/llvm-mingw/releases/download/${version}/${archive}"
+          $dest = "C:\llvm-mingw"
+
+          Write-Host "Downloading llvm-mingw from $url"
+          Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\$archive" -UseBasicParsing
+          Write-Host "Extracting to $dest"
+          Expand-Archive -Path "$env:TEMP\$archive" -DestinationPath "C:\"
+          Rename-Item "C:\llvm-mingw-${version}-ucrt-aarch64" $dest
+
+          # Put llvm-mingw at the front of PATH so its gcc/clang shadow
+          # the x86-64 MinGW gcc that ships with Git for Windows.
+          echo "$dest\bin" >> $env:GITHUB_PATH
+          $env:PATH = "$dest\bin;$env:PATH"
+
+          Write-Host "CC: $(gcc --version 2>&1 | Select-Object -First 1)"
+          Write-Host "Target: $(gcc -dumpmachine)"
+
+      - name: Install crypto/x509 test root
+        shell: pwsh
+        run: |
+          # The Go crypto/x509 tests require a specific test root CA.
+          # See: https://github.com/golang/build/blob/master/env/windows-arm64/azure/startup.ps1
+          $certUrl = "https://storage.googleapis.com/go-builder-data/platform_root_cert.pem"
+          $certFile = "$env:TEMP\test_root.pem"
+          Invoke-WebRequest -Uri $certUrl -OutFile $certFile -UseBasicParsing
+          Import-Certificate -FilePath $certFile -CertStoreLocation "Cert:\LocalMachine\Root"
+          Write-Host "Installed crypto/x509 test root certificate"
+
+      - name: Disable Windows Defender real-time monitoring
+        shell: pwsh
+        run: |
+          # Real-time scanning slows down compilation significantly.
+          # The Azure startup.ps1 does the same.
+          Set-MpPreference -DisableRealtimeMonitoring $true
+          Write-Host "Disabled Windows Defender real-time monitoring"
 
       - name: Build Go toolchain
         shell: pwsh
