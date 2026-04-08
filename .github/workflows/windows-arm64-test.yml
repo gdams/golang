@@ -119,18 +119,21 @@ jobs:
           Import-Certificate -FilePath $certFile -CertStoreLocation "Cert:\LocalMachine\Root"
           Write-Host "Installed crypto/x509 test root certificate"
 
-      - name: Uninstall GDB
+      - name: Remove broken x86-64 tools
         shell: pwsh
         run: |
-          # The GDB bundled with Git-for-Windows is x86-64 and does not
-          # work correctly on ARM64. Remove it so the Go test suite skips
-          # GDB-dependent tests (runtime TestGdb*) instead of failing.
-          $gdb = Get-Command gdb -ErrorAction SilentlyContinue
-          if ($gdb) {
-            Write-Host "Removing GDB at $($gdb.Source)"
-            Remove-Item $gdb.Source -Force
-          } else {
-            Write-Host "GDB not found, nothing to remove"
+          # Several tools pre-installed on the runner (from Strawberry Perl,
+          # Git-for-Windows, etc.) are x86-64 binaries that crash or
+          # misbehave under ARM64 emulation. Remove them so the Go test
+          # suite skips the dependent tests instead of failing.
+          foreach ($tool in @("gdb", "patch", "pkg-config")) {
+            $cmd = Get-Command $tool -ErrorAction SilentlyContinue
+            if ($cmd) {
+              Write-Host "Removing $tool at $($cmd.Source)"
+              Remove-Item $cmd.Source -Force
+            } else {
+              Write-Host "$tool not found, nothing to remove"
+            }
           }
 
       - name: Disable Windows Defender real-time monitoring
