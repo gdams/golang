@@ -75,16 +75,21 @@ jobs:
           echo "Bootstrap GOROOT: $goroot"
           go version
 
+      - name: Checkout Go build infrastructure
+        uses: actions/checkout@v4
+        with:
+          repository: golang/build
+          path: gobuilder
+          fetch-depth: 1
+
       - name: Set up build environment
         shell: pwsh
         run: |
-          # Clone the Go build infrastructure repo and run the official
-          # windows-arm64 setup script. This installs the C toolchain,
-          # test certificates, and other dependencies that the Go test
-          # suite expects.
+          # Run the official windows-arm64 setup script. This installs the
+          # C toolchain, test certificates, and other dependencies that
+          # the Go test suite expects.
           # See: https://github.com/golang/build/blob/master/env/windows-arm64/azure/startup.ps1
-          git clone --depth 1 https://github.com/golang/build.git C:\gobuilder
-          & C:\gobuilder\env\windows-arm64\azure\startup.ps1
+          & ${{ github.workspace }}\gobuilder\env\windows-arm64\azure\startup.ps1
 
       - name: Build Go toolchain
         shell: pwsh
