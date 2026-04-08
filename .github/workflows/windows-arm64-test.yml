@@ -119,6 +119,20 @@ jobs:
           Import-Certificate -FilePath $certFile -CertStoreLocation "Cert:\LocalMachine\Root"
           Write-Host "Installed crypto/x509 test root certificate"
 
+      - name: Uninstall GDB
+        shell: pwsh
+        run: |
+          # The GDB bundled with Git-for-Windows is x86-64 and does not
+          # work correctly on ARM64. Remove it so the Go test suite skips
+          # GDB-dependent tests (runtime TestGdb*) instead of failing.
+          $gdb = Get-Command gdb -ErrorAction SilentlyContinue
+          if ($gdb) {
+            Write-Host "Removing GDB at $($gdb.Source)"
+            Remove-Item $gdb.Source -Force
+          } else {
+            Write-Host "GDB not found, nothing to remove"
+          }
+
       - name: Disable Windows Defender real-time monitoring
         shell: pwsh
         run: |
