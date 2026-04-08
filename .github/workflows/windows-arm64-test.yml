@@ -33,10 +33,10 @@ on:
         type: string
         default: "gotip-windows-arm64-github"
       repository:
-        description: "Go repository to check out (owner/repo)"
+        description: "Go repository URL to clone"
         required: false
         type: string
-        default: "golang/go"
+        default: "https://go.googlesource.com/go"
 
 permissions:
   contents: read
@@ -52,11 +52,11 @@ jobs:
 
     steps:
       - name: Checkout Go source
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ inputs.repository }}
-          ref: ${{ inputs.commit_sha }}
-          fetch-depth: 1
+        shell: pwsh
+        run: |
+          git clone --depth 1 ${{ inputs.repository }} .
+          git fetch --depth 1 origin ${{ inputs.commit_sha }}
+          git checkout ${{ inputs.commit_sha }}
 
       - name: Set up bootstrap Go
         uses: actions/setup-go@v6
